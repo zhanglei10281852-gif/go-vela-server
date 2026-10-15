@@ -1,3 +1,3 @@
-读取 worker CRUD、register token 表、JWT claims、权限与 establish middleware 以及代次回归测试；目标包与重复执行专项测试通过。全量测试中失败的测试文件不在本题改动列表，失败原因是仓库既有 CRLF 断言和规则断言。
+审阅工作节点注册、认证、刷新、删除、权限中间件和代次回归测试；目标包及重复执行专项测试通过。全量测试出现未改动模块的既有断言失败，属于换行符差异和流水线规则断言。
 
 Targeted tests: PASS. Full suite: failures are outside changed files and are existing LF/CRLF or pipeline-rule assertions.
