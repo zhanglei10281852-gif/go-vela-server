@@ -1,0 +1,19 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "register token 只能创建被授权的 worker 代次，重复或删除后的重放不能创建替代记录。"
+  - id: 2
+    type: f2p
+    text: "worker 删除后，旧 auth token 不能更新、refresh 或作用于同 hostname 的新代次。"
+  - id: 3
+    type: f2p
+    text: "删除或重建与迟到 PUT、refresh 交错时，旧请求不会覆盖新 worker 的任何运行状态。"
+  - id: 4
+    type: f2p
+    text: "数据库创建成功但 auth token 签发失败时，重试可恢复或清理未完成代次且 hostname 不被永久占用。"
+  - id: 5
+    type: f2p
+    text: "同 hostname 重建得到新的凭据代次，当前代次的 register、update 和 refresh 正常工作。"
+  - id: 6
+    type: p2p
+    text: "既有 token 时长、worker 列表与指标以及配置的 server-worker 共享 token 模式保持兼容。"
