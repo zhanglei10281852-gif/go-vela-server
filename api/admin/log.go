@@ -162,10 +162,18 @@ func CleanLogs(c *gin.Context) {
 	}
 
 	duration := time.Since(startTime)
+
+	// when the request resumed an unfinished cleanup generation, the batch
+	// size actually used is the generation's persisted one
+	effectiveBatchSize := batchSize
+	if result.BatchSize > 0 {
+		effectiveBatchSize = result.BatchSize
+	}
+
 	batchesProcessed := int64(0)
 
-	if batchSize > 0 {
-		batchesProcessed = (result.DeletedCount + int64(batchSize) - 1) / int64(batchSize) // ceiling division
+	if effectiveBatchSize > 0 {
+		batchesProcessed = (result.DeletedCount + int64(effectiveBatchSize) - 1) / int64(effectiveBatchSize) // ceiling division
 	}
 
 	l.WithFields(logrus.Fields{
