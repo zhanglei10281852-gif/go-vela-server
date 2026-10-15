@@ -1,0 +1,19 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "service 或 step 创建中途失败时，不会暴露可消费的半成品资源图或 executable。"
+  - id: 2
+    type: f2p
+    text: "失败后的重试不会因遗留 build number 冲突，并只产生一套 build、service 和 step。"
+  - id: 3
+    type: f2p
+    text: "build executable 创建失败时，已写入资源会被隔离并可恢复，不能留下孤立可领取记录。"
+  - id: 4
+    type: f2p
+    text: "清理或回滚部分失败后，后续调用可依据持久化状态继续收敛且不会重复创建子资源。"
+  - id: 5
+    type: f2p
+    text: "webhook、schedule、手动创建和 restart 对规划失败及重试遵守相同完整提交语义。"
+  - id: 6
+    type: p2p
+    text: "规划前的编译或路由错误、pending approval 与正常成功构建保持既有行为。"
