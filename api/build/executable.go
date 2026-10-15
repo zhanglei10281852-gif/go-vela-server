@@ -3,16 +3,12 @@
 package build
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 
-	"github.com/go-vela/server/api/types"
-	"github.com/go-vela/server/compiler/types/pipeline"
 	"github.com/go-vela/server/database"
 	"github.com/go-vela/server/router/middleware/build"
 	"github.com/go-vela/server/router/middleware/repo"
@@ -88,41 +84,4 @@ func GetBuildExecutable(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, bExecutable)
-}
-
-// PublishBuildExecutable marshals a pipeline.Build into bytes and pushes that data to the build_executables table to be
-// requested by a worker whenever the build has been picked up.
-func PublishBuildExecutable(ctx context.Context, db database.Interface, p *pipeline.Build, b *types.Build) error {
-	// marshal pipeline build into byte data to add to the build executable object
-	byteExecutable, err := json.Marshal(p)
-	if err != nil {
-		logrus.Errorf("failed to marshal build executable: %v", err)
-
-		// error out the build
-		CleanBuild(ctx, db, b, nil, nil, err)
-
-		return err
-	}
-
-	// create build executable to push to database
-	bExecutable := new(types.BuildExecutable)
-	bExecutable.SetBuildID(b.GetID())
-	bExecutable.SetData(byteExecutable)
-
-	// send database call to create a build executable
-	err = db.CreateBuildExecutable(ctx, bExecutable)
-	if err != nil {
-		logrus.Errorf("failed to publish build executable to database: %v", err)
-
-		// error out the build
-		CleanBuild(ctx, db, b, nil, nil, err)
-
-		return err
-	}
-
-	logrus.WithFields(logrus.Fields{
-		"build_executable_id": bExecutable.GetBuildID(),
-	}).Info("created build executable")
-
-	return nil
 }

@@ -4,7 +4,6 @@ package step
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -12,25 +11,29 @@ import (
 	"github.com/go-vela/server/api/types"
 	"github.com/go-vela/server/compiler/types/pipeline"
 	"github.com/go-vela/server/constants"
-	"github.com/go-vela/server/database"
 	"github.com/go-vela/server/scm"
 )
 
 // PlanSteps is a helper function to plan all steps
-// in the build for execution. This creates the steps
-// for the build.
-func PlanSteps(ctx context.Context, database database.Interface, scm scm.Service, p *pipeline.Build, b *types.Build) ([]*types.Step, error) {
+// in the build for execution. This constructs the step
+// resources for the build from the pipeline and merges
+// the step environment variables into the pipeline.
+//
+// No database resources are created here. The returned steps are persisted
+// atomically, together with the build, its services, logs, and build
+// executable, by PlanBuild so that a failure while planning can never leave a
+// partial set of steps behind.
+func PlanSteps(p *pipeline.Build, b *types.Build) ([]*types.Step, error) {
 	// variable to store planned steps
 	steps := []*types.Step{}
 
 	// iterate through all pipeline stages
 	for _, stage := range p.Stages {
 		// iterate through all steps for each pipeline stage
-		for _, step := range stage.Steps {
-			// create the step object
-			s, err := planStep(ctx, database, scm, b, step, stage.Name)
+		for _, c := range stage.Steps {
+			s, err := planStep(b, c, stage.Name)
 			if err != nil {
-				return steps, err
+				return nil, err
 			}
 
 			steps = append(steps, s)
@@ -38,10 +41,10 @@ func PlanSteps(ctx context.Context, database database.Interface, scm scm.Service
 	}
 
 	// iterate through all pipeline steps
-	for _, step := range p.Steps {
-		s, err := planStep(ctx, database, scm, b, step, "")
+	for _, c := range p.Steps {
+		s, err := planStep(b, c, "")
 		if err != nil {
-			return steps, err
+			return nil, err
 		}
 
 		steps = append(steps, s)
@@ -50,7 +53,7 @@ func PlanSteps(ctx context.Context, database database.Interface, scm scm.Service
 	return steps, nil
 }
 
-func planStep(ctx context.Context, database database.Interface, scm scm.Service, b *types.Build, c *pipeline.Container, stage string) (*types.Step, error) {
+func planStep(b *types.Build, c *pipeline.Container, stage string) (*types.Step, error) {
 	// create the step object
 	s := new(types.Step)
 	s.SetBuildID(b.GetID())
@@ -63,56 +66,52 @@ func planStep(ctx context.Context, database database.Interface, scm scm.Service,
 	s.SetReportAs(c.ReportAs)
 	s.SetCreated(time.Now().UTC().Unix())
 
-	// send API call to create the step
-	s, err := database.CreateStep(ctx, s)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create step %s: %w", s.GetName(), err)
-	}
-
-	logrus.WithFields(logrus.Fields{
-		"step":    s.GetName(),
-		"step_id": s.GetID(),
-		"org":     b.GetRepo().GetOrg(),
-		"repo":    b.GetRepo().GetName(),
-		"repo_id": b.GetRepo().GetID(),
-	}).Info("step created")
-
 	// populate environment variables from step
-	err = c.MergeEnv(s.Environment())
+	err := c.MergeEnv(s.Environment())
 	if err != nil {
 		return nil, err
 	}
 
-	// create the log object
-	l := new(types.Log)
-	l.SetStepID(s.GetID())
-	l.SetBuildID(b.GetID())
-	l.SetRepoID(b.GetRepo().GetID())
-	l.SetData([]byte{})
-	l.SetCreatedAt(time.Now().UTC().Unix())
+	return s, nil
+}
 
-	// send API call to create the step logs
-	err = database.CreateLog(ctx, l)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create logs for step %s: %w", s.GetName(), err)
+// ReportStepStatuses sends commit statuses for the steps in the build that
+// were configured with report_as. This is performed after the planning
+// transaction has committed because the status update is an external side
+// effect that cannot be rolled back; failures are logged but do not fail the
+// build, matching the previous behavior.
+func ReportStepStatuses(ctx context.Context, client scm.Service, p *pipeline.Build, b *types.Build, steps []*types.Step) {
+	// index the created steps by number so the pipeline containers can be
+	// matched to the persisted steps carrying their final IDs
+	byNumber := make(map[int32]*types.Step, len(steps))
+
+	for _, s := range steps {
+		byNumber[s.GetNumber()] = s
 	}
 
-	logrus.WithFields(logrus.Fields{
-		"step":    s.GetName(),
-		"step_id": s.GetID(),
-		"log_id":  l.GetID(), // it won't have an ID here
-		"org":     b.GetRepo().GetOrg(),
-		"repo":    b.GetRepo().GetName(),
-		"repo_id": b.GetRepo().GetID(),
-	}).Info("log for step created")
+	// collect the pipeline containers in the same order that PlanSteps does
+	containers := make([]*pipeline.Container, 0, len(steps))
 
-	if len(s.GetReportAs()) > 0 {
+	for _, stage := range p.Stages {
+		containers = append(containers, stage.Steps...)
+	}
+
+	containers = append(containers, p.Steps...)
+
+	for _, c := range containers {
+		if len(c.ReportAs) == 0 {
+			continue
+		}
+
+		s, ok := byNumber[c.Number]
+		if !ok {
+			continue
+		}
+
 		// send API call to set the status on the commit using token in environment
-		err := scm.StepStatus(ctx, b, s, c.Environment["VELA_NETRC_PASSWORD"])
+		err := client.StepStatus(ctx, b, s, c.Environment["VELA_NETRC_PASSWORD"])
 		if err != nil {
 			logrus.Errorf("unable to set commit status for build: %v", err)
 		}
 	}
-
-	return s, nil
 }

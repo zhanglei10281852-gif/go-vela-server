@@ -1,0 +1,1302 @@
+diff --git a/api/build/compile_publish.go b/api/build/compile_publish.go
+index af981074..a878df3e 100644
+--- a/api/build/compile_publish.go
++++ b/api/build/compile_publish.go
+@@ -390,14 +390,21 @@ func CompileAndPublish(
+ 
+ 		b.SetPipelineID(pipeline.GetID())
+ 
+-		// create the objects from the pipeline in the database
+-		// TODO:
+-		// - if a build gets created and something else fails midway,
+-		//   the next loop will attempt to create the same build,
+-		//   using the same Number and thus create a constraint
+-		//   conflict; consider deleting the partially created
+-		//   build object in the database
+-		b, err = PlanBuild(ctx, database, scm, p, b, r)
++		// determine the queue route before persisting any build resources so a
++		// routing validation failure leaves no build or child resources behind
++		route, routeErr := queue.Route(&p.Worker)
++		if routeErr != nil {
++			retErr := fmt.Errorf("unable to set route for %s: %w", r.GetFullName(), routeErr)
++
++			return nil, nil, http.StatusBadRequest, retErr
++		}
++
++		b.SetRoute(route)
++
++		// atomically create the build, all services, all steps, their logs, and
++		// the build executable. On failure nothing is committed, so the next
++		// attempt cannot conflict with a build number or duplicate children.
++		b, err = PlanBuild(ctx, database, cache, scm, p, b, r)
+ 		if err != nil {
+ 			retErr := fmt.Errorf("%s: %w", baseErr, err)
+ 
+@@ -405,7 +412,11 @@ func CompileAndPublish(
+ 			if i < cfg.Retries-1 {
+ 				logger.WithError(retErr).Warningf("retrying #%d", i+1)
+ 
+-				// reset fields set by cleanBuild for retry
++				// reset build fields for a fresh planning attempt; the failed
++				// attempt left no committed build, so clear any identifiers it
++				// assigned in memory before retrying
++				b.SetID(0)
++				b.SetNumber(0)
+ 				b.SetError("")
+ 				b.SetStatus(constants.StatusPending)
+ 				b.SetFinished(0)
+@@ -448,47 +459,9 @@ func CompileAndPublish(
+ 		return nil, nil, http.StatusInternalServerError, retErr
+ 	}
+ 
+-	var (
+-		scmRepos []string
+-		scmPerms map[string]string
+-	)
+-
+-	if p.Git != nil {
+-		scmRepos = p.Git.Token.Repositories
+-		scmPerms = p.Git.Token.Permissions
+-	}
+-
+-	scmBuildToken, scmBuildTokenExp, err := scm.GetNetrcPassword(ctx, database, cache, b, scmRepos, scmPerms)
+-	if err != nil {
+-		retErr := fmt.Errorf("%s: failed to get SCM build token for %s: %w", baseErr, r.GetFullName(), err)
+-
+-		return nil, nil, http.StatusInternalServerError, retErr
+-	}
+-
+-	p.Token = scmBuildToken
+-	p.TokenExp = scmBuildTokenExp
+-
+-	// determine queue route
+-	route, err := queue.Route(&p.Worker)
+-	if err != nil {
+-		retErr := fmt.Errorf("unable to set route for build %d for %s: %w", b.GetNumber(), r.GetFullName(), err)
+-
+-		// error out the build
+-		CleanBuild(ctx, database, b, nil, nil, retErr)
+-
+-		return nil, nil, http.StatusBadRequest, retErr
+-	}
+-
+-	b.SetRoute(route)
+-
+-	// publish the pipeline.Build to the build_executables table to be requested by a worker
+-	err = PublishBuildExecutable(ctx, database, p, b)
+-	if err != nil {
+-		retErr := fmt.Errorf("unable to publish build executable for %s/%d: %w", r.GetFullName(), b.GetNumber(), err)
+-
+-		return nil, nil, http.StatusInternalServerError, retErr
+-	}
+-
++	// the build, services, steps, logs, and build executable were committed
++	// together by PlanBuild, so the queue item now points at a fully
++	// consumable build
+ 	return p, models.ToItem(b), http.StatusCreated, nil
+ }
+ 
+diff --git a/api/build/executable.go b/api/build/executable.go
+index 86670868..2b818ccc 100644
+--- a/api/build/executable.go
++++ b/api/build/executable.go
+@@ -3,16 +3,12 @@
+ package build
+ 
+ import (
+-	"context"
+-	"encoding/json"
+ 	"fmt"
+ 	"net/http"
+ 
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/sirupsen/logrus"
+ 
+-	"github.com/go-vela/server/api/types"
+-	"github.com/go-vela/server/compiler/types/pipeline"
+ 	"github.com/go-vela/server/database"
+ 	"github.com/go-vela/server/router/middleware/build"
+ 	"github.com/go-vela/server/router/middleware/repo"
+@@ -89,40 +85,3 @@ func GetBuildExecutable(c *gin.Context) {
+ 
+ 	c.JSON(http.StatusOK, bExecutable)
+ }
+-
+-// PublishBuildExecutable marshals a pipeline.Build into bytes and pushes that data to the build_executables table to be
+-// requested by a worker whenever the build has been picked up.
+-func PublishBuildExecutable(ctx context.Context, db database.Interface, p *pipeline.Build, b *types.Build) error {
+-	// marshal pipeline build into byte data to add to the build executable object
+-	byteExecutable, err := json.Marshal(p)
+-	if err != nil {
+-		logrus.Errorf("failed to marshal build executable: %v", err)
+-
+-		// error out the build
+-		CleanBuild(ctx, db, b, nil, nil, err)
+-
+-		return err
+-	}
+-
+-	// create build executable to push to database
+-	bExecutable := new(types.BuildExecutable)
+-	bExecutable.SetBuildID(b.GetID())
+-	bExecutable.SetData(byteExecutable)
+-
+-	// send database call to create a build executable
+-	err = db.CreateBuildExecutable(ctx, bExecutable)
+-	if err != nil {
+-		logrus.Errorf("failed to publish build executable to database: %v", err)
+-
+-		// error out the build
+-		CleanBuild(ctx, db, b, nil, nil, err)
+-
+-		return err
+-	}
+-
+-	logrus.WithFields(logrus.Fields{
+-		"build_executable_id": bExecutable.GetBuildID(),
+-	}).Info("created build executable")
+-
+-	return nil
+-}
+diff --git a/api/build/plan.go b/api/build/plan.go
+index 544cd1cd..d1885980 100644
+--- a/api/build/plan.go
++++ b/api/build/plan.go
+@@ -4,6 +4,7 @@ package build
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"fmt"
+ 	"time"
+ 
+@@ -12,57 +13,106 @@ import (
+ 	"github.com/go-vela/server/api/service"
+ 	"github.com/go-vela/server/api/step"
+ 	"github.com/go-vela/server/api/types"
++	"github.com/go-vela/server/cache"
+ 	"github.com/go-vela/server/compiler/types/pipeline"
+ 	"github.com/go-vela/server/database"
+ 	"github.com/go-vela/server/scm"
+ )
+ 
+ // PlanBuild is a helper function to plan the build for
+-// execution. This creates all resources, like steps
+-// and services, for the build.
+-// TODO:
+-// - return build and error.
+-func PlanBuild(ctx context.Context, database database.Interface, scm scm.Service, p *pipeline.Build, b *types.Build, r *types.Repo) (*types.Build, error) {
++// execution. It constructs all resources for the build -
++// the build itself, all services, all steps, the log
++// placeholders, and the build executable - and persists
++// them as a single atomic unit.
++//
++// Either every resource commits together and the build is immediately
++// consumable, or no resource is created and the next attempt starts without a
++// conflicting build number or any orphaned child resources. All recovery is
++// driven by the single database transaction's committed state, never by an
++// in-process list of objects that may have been created before a failure.
++func PlanBuild(ctx context.Context, db database.Interface, tknCache cache.Service, scm scm.Service, p *pipeline.Build, b *types.Build, r *types.Repo) (*types.Build, error) {
+ 	// update fields in build object
+ 	b.SetCreated(time.Now().UTC().Unix())
+ 
+-	// send API call to create the build
+-	b, err := database.CreateBuild(ctx, b)
++	// construct all child resources in memory; nothing is persisted yet
++	services, err := service.PlanServices(p, b)
+ 	if err != nil {
+-		// clean up the objects from the pipeline in the database
+-		// TODO:
+-		// - even if it was created, we need to get the new build id
+-		//   otherwise it will be 0, which attempts to INSERT instead
+-		//   of UPDATE-ing the existing build - which results in
+-		//   a constraint error (repo_id, number)
+-		// - do we want to update the build or just delete it?
+-		CleanBuild(ctx, database, b, nil, nil, err)
++		return nil, err
++	}
++
++	steps, err := step.PlanSteps(p, b)
++	if err != nil {
++		return nil, err
++	}
++
++	var (
++		scmRepos []string
++		scmPerms map[string]string
++	)
++
++	if p.Git != nil {
++		scmRepos = p.Git.Token.Repositories
++		scmPerms = p.Git.Token.Permissions
++	}
++
++	// finalize runs inside the planning transaction after the build row has
++	// been inserted, so the build has its final ID used to scope the SCM
++	// token. It returns the marshaled executable that gets inserted in the
++	// same transaction. Returning an error rolls back the entire build plan.
++	finalize := func(b *types.Build, _ []*types.Service, _ []*types.Step) ([]byte, error) {
++		scmBuildToken, scmBuildTokenExp, err := scm.GetNetrcPassword(ctx, db, tknCache, b, scmRepos, scmPerms)
++		if err != nil {
++			return nil, fmt.Errorf("failed to get SCM build token for %s: %w", r.GetFullName(), err)
++		}
++
++		p.Token = scmBuildToken
++		p.TokenExp = scmBuildTokenExp
++
++		// marshal pipeline build into byte data to add to the build executable object
++		byteExecutable, err := json.Marshal(p)
++		if err != nil {
++			return nil, fmt.Errorf("failed to marshal build executable for %s: %w", r.GetFullName(), err)
++		}
+ 
++		return byteExecutable, nil
++	}
++
++	// atomically create the build, services, steps, logs, and executable
++	result, err := db.PlanBuild(ctx, b, services, steps, finalize)
++	if err != nil {
+ 		return nil, fmt.Errorf("unable to create new build for %s: %w", r.GetFullName(), err)
+ 	}
+ 
++	b = result.Build
++
+ 	logrus.WithFields(logrus.Fields{
+ 		"build":    b.GetNumber(),
+ 		"build_id": b.GetID(),
+ 	}).Info("build created")
+ 
+-	// plan all services for the build
+-	services, err := service.PlanServices(ctx, database, p, b)
+-	if err != nil {
+-		// clean up the objects from the pipeline in the database
+-		CleanBuild(ctx, database, b, services, nil, err)
+-
+-		return nil, err
++	for _, s := range result.Services {
++		logrus.WithFields(logrus.Fields{
++			"service":    s.GetName(),
++			"service_id": s.GetID(),
++			"org":        b.GetRepo().GetOrg(),
++			"repo":       b.GetRepo().GetName(),
++			"repo_id":    b.GetRepo().GetID(),
++		}).Info("service created")
+ 	}
+ 
+-	// plan all steps for the build
+-	steps, err := step.PlanSteps(ctx, database, scm, p, b)
+-	if err != nil {
+-		// clean up the objects from the pipeline in the database
+-		CleanBuild(ctx, database, b, services, steps, err)
+-
+-		return nil, err
++	for _, s := range result.Steps {
++		logrus.WithFields(logrus.Fields{
++			"step":    s.GetName(),
++			"step_id": s.GetID(),
++			"org":     b.GetRepo().GetOrg(),
++			"repo":    b.GetRepo().GetName(),
++			"repo_id": b.GetRepo().GetID(),
++		}).Info("step created")
+ 	}
+ 
++	// the commit status updates are external side effects that cannot be
++	// rolled back, so they are only sent once the full plan is committed
++	step.ReportStepStatuses(ctx, scm, p, b, result.Steps)
++
+ 	return b, nil
+ }
+diff --git a/api/service/plan.go b/api/service/plan.go
+index 040a421f..33a750d5 100644
+--- a/api/service/plan.go
++++ b/api/service/plan.go
+@@ -3,24 +3,25 @@
+ package service
+ 
+ import (
+-	"context"
+-	"fmt"
+ 	"time"
+ 
+-	"github.com/sirupsen/logrus"
+-
+ 	"github.com/go-vela/server/api/types"
+ 	"github.com/go-vela/server/compiler/types/pipeline"
+ 	"github.com/go-vela/server/constants"
+-	"github.com/go-vela/server/database"
+ )
+ 
+ // PlanServices is a helper function to plan all services
+-// in the build for execution. This creates the services
+-// for the build.
+-func PlanServices(ctx context.Context, database database.Interface, p *pipeline.Build, b *types.Build) ([]*types.Service, error) {
++// in the build for execution. This constructs the service
++// resources for the build from the pipeline and merges the
++// service environment variables into the pipeline.
++//
++// No database resources are created here. The returned services are
++// persisted atomically, together with the build, its steps, logs, and build
++// executable, by PlanBuild so that a failure while planning can never leave
++// a partial set of services behind.
++func PlanServices(p *pipeline.Build, b *types.Build) ([]*types.Service, error) {
+ 	// variable to store planned services
+-	services := []*types.Service{}
++	services := make([]*types.Service, 0, len(p.Services))
+ 
+ 	// iterate through all pipeline services
+ 	for _, service := range p.Services {
+@@ -34,47 +35,12 @@ func PlanServices(ctx context.Context, database database.Interface, p *pipeline.
+ 		s.SetStatus(constants.StatusPending)
+ 		s.SetCreated(time.Now().UTC().Unix())
+ 
+-		// send API call to create the service
+-		s, err := database.CreateService(ctx, s)
+-		if err != nil {
+-			return services, fmt.Errorf("unable to create service %s: %w", s.GetName(), err)
+-		}
+-
+-		logrus.WithFields(logrus.Fields{
+-			"service":    s.GetName(),
+-			"service_id": s.GetID(),
+-			"org":        b.GetRepo().GetOrg(),
+-			"repo":       b.GetRepo().GetName(),
+-			"repo_id":    b.GetRepo().GetID(),
+-		}).Info("service created")
+-
+-		err = service.MergeEnv(s.Environment())
+-		if err != nil {
+-			return services, err
+-		}
+-
+-		// create the log object
+-		l := new(types.Log)
+-		l.SetServiceID(s.GetID())
+-		l.SetBuildID(b.GetID())
+-		l.SetRepoID(b.GetRepo().GetID())
+-		l.SetData([]byte{})
+-		l.SetCreatedAt(time.Now().UTC().Unix())
+-
+-		// send API call to create the service logs
+-		err = database.CreateLog(ctx, l)
++		err := service.MergeEnv(s.Environment())
+ 		if err != nil {
+-			return services, fmt.Errorf("unable to create service logs for service %s: %w", s.GetName(), err)
++			return nil, err
+ 		}
+ 
+-		logrus.WithFields(logrus.Fields{
+-			"service":    s.GetName(),
+-			"service_id": s.GetID(),
+-			"log_id":     l.GetID(), // it won't have an ID here, because CreateLog doesn't return the created log
+-			"org":        b.GetRepo().GetOrg(),
+-			"repo":       b.GetRepo().GetName(),
+-			"repo_id":    b.GetRepo().GetID(),
+-		}).Info("log for service created")
++		services = append(services, s)
+ 	}
+ 
+ 	return services, nil
+diff --git a/api/step/plan.go b/api/step/plan.go
+index 6f1864b7..4bbafd8e 100644
+--- a/api/step/plan.go
++++ b/api/step/plan.go
+@@ -4,7 +4,6 @@ package step
+ 
+ import (
+ 	"context"
+-	"fmt"
+ 	"time"
+ 
+ 	"github.com/sirupsen/logrus"
+@@ -12,25 +11,29 @@ import (
+ 	"github.com/go-vela/server/api/types"
+ 	"github.com/go-vela/server/compiler/types/pipeline"
+ 	"github.com/go-vela/server/constants"
+-	"github.com/go-vela/server/database"
+ 	"github.com/go-vela/server/scm"
+ )
+ 
+ // PlanSteps is a helper function to plan all steps
+-// in the build for execution. This creates the steps
+-// for the build.
+-func PlanSteps(ctx context.Context, database database.Interface, scm scm.Service, p *pipeline.Build, b *types.Build) ([]*types.Step, error) {
++// in the build for execution. This constructs the step
++// resources for the build from the pipeline and merges
++// the step environment variables into the pipeline.
++//
++// No database resources are created here. The returned steps are persisted
++// atomically, together with the build, its services, logs, and build
++// executable, by PlanBuild so that a failure while planning can never leave a
++// partial set of steps behind.
++func PlanSteps(p *pipeline.Build, b *types.Build) ([]*types.Step, error) {
+ 	// variable to store planned steps
+ 	steps := []*types.Step{}
+ 
+ 	// iterate through all pipeline stages
+ 	for _, stage := range p.Stages {
+ 		// iterate through all steps for each pipeline stage
+-		for _, step := range stage.Steps {
+-			// create the step object
+-			s, err := planStep(ctx, database, scm, b, step, stage.Name)
++		for _, c := range stage.Steps {
++			s, err := planStep(b, c, stage.Name)
+ 			if err != nil {
+-				return steps, err
++				return nil, err
+ 			}
+ 
+ 			steps = append(steps, s)
+@@ -38,10 +41,10 @@ func PlanSteps(ctx context.Context, database database.Interface, scm scm.Service
+ 	}
+ 
+ 	// iterate through all pipeline steps
+-	for _, step := range p.Steps {
+-		s, err := planStep(ctx, database, scm, b, step, "")
++	for _, c := range p.Steps {
++		s, err := planStep(b, c, "")
+ 		if err != nil {
+-			return steps, err
++			return nil, err
+ 		}
+ 
+ 		steps = append(steps, s)
+@@ -50,7 +53,7 @@ func PlanSteps(ctx context.Context, database database.Interface, scm scm.Service
+ 	return steps, nil
+ }
+ 
+-func planStep(ctx context.Context, database database.Interface, scm scm.Service, b *types.Build, c *pipeline.Container, stage string) (*types.Step, error) {
++func planStep(b *types.Build, c *pipeline.Container, stage string) (*types.Step, error) {
+ 	// create the step object
+ 	s := new(types.Step)
+ 	s.SetBuildID(b.GetID())
+@@ -63,56 +66,52 @@ func planStep(ctx context.Context, database database.Interface, scm scm.Service,
+ 	s.SetReportAs(c.ReportAs)
+ 	s.SetCreated(time.Now().UTC().Unix())
+ 
+-	// send API call to create the step
+-	s, err := database.CreateStep(ctx, s)
++	// populate environment variables from step
++	err := c.MergeEnv(s.Environment())
+ 	if err != nil {
+-		return nil, fmt.Errorf("unable to create step %s: %w", s.GetName(), err)
++		return nil, err
+ 	}
+ 
+-	logrus.WithFields(logrus.Fields{
+-		"step":    s.GetName(),
+-		"step_id": s.GetID(),
+-		"org":     b.GetRepo().GetOrg(),
+-		"repo":    b.GetRepo().GetName(),
+-		"repo_id": b.GetRepo().GetID(),
+-	}).Info("step created")
++	return s, nil
++}
+ 
+-	// populate environment variables from step
+-	err = c.MergeEnv(s.Environment())
+-	if err != nil {
+-		return nil, err
++// ReportStepStatuses sends commit statuses for the steps in the build that
++// were configured with report_as. This is performed after the planning
++// transaction has committed because the status update is an external side
++// effect that cannot be rolled back; failures are logged but do not fail the
++// build, matching the previous behavior.
++func ReportStepStatuses(ctx context.Context, client scm.Service, p *pipeline.Build, b *types.Build, steps []*types.Step) {
++	// index the created steps by number so the pipeline containers can be
++	// matched to the persisted steps carrying their final IDs
++	byNumber := make(map[int32]*types.Step, len(steps))
++
++	for _, s := range steps {
++		byNumber[s.GetNumber()] = s
+ 	}
+ 
+-	// create the log object
+-	l := new(types.Log)
+-	l.SetStepID(s.GetID())
+-	l.SetBuildID(b.GetID())
+-	l.SetRepoID(b.GetRepo().GetID())
+-	l.SetData([]byte{})
+-	l.SetCreatedAt(time.Now().UTC().Unix())
++	// collect the pipeline containers in the same order that PlanSteps does
++	containers := make([]*pipeline.Container, 0, len(steps))
+ 
+-	// send API call to create the step logs
+-	err = database.CreateLog(ctx, l)
+-	if err != nil {
+-		return nil, fmt.Errorf("unable to create logs for step %s: %w", s.GetName(), err)
++	for _, stage := range p.Stages {
++		containers = append(containers, stage.Steps...)
+ 	}
+ 
+-	logrus.WithFields(logrus.Fields{
+-		"step":    s.GetName(),
+-		"step_id": s.GetID(),
+-		"log_id":  l.GetID(), // it won't have an ID here
+-		"org":     b.GetRepo().GetOrg(),
+-		"repo":    b.GetRepo().GetName(),
+-		"repo_id": b.GetRepo().GetID(),
+-	}).Info("log for step created")
++	containers = append(containers, p.Steps...)
++
++	for _, c := range containers {
++		if len(c.ReportAs) == 0 {
++			continue
++		}
++
++		s, ok := byNumber[c.Number]
++		if !ok {
++			continue
++		}
+ 
+-	if len(s.GetReportAs()) > 0 {
+ 		// send API call to set the status on the commit using token in environment
+-		err := scm.StepStatus(ctx, b, s, c.Environment["VELA_NETRC_PASSWORD"])
++		err := client.StepStatus(ctx, b, s, c.Environment["VELA_NETRC_PASSWORD"])
+ 		if err != nil {
+ 			logrus.Errorf("unable to set commit status for build: %v", err)
+ 		}
+ 	}
+-
+-	return s, nil
+ }
+diff --git a/database/interface.go b/database/interface.go
+index e2a6343c..dde87a52 100644
+--- a/database/interface.go
++++ b/database/interface.go
+@@ -3,6 +3,9 @@
+ package database
+ 
+ import (
++	"context"
++
++	api "github.com/go-vela/server/api/types"
+ 	"github.com/go-vela/server/database/build"
+ 	"github.com/go-vela/server/database/dashboard"
+ 	"github.com/go-vela/server/database/deployment"
+@@ -39,6 +42,12 @@ type Interface interface {
+ 
+ 	// Resource Interface Functions
+ 
++	// PlanBuild defines a function that atomically creates a build together
++	// with all of its services, steps, logs, and build executable inside a
++	// single transaction. Either every resource is committed together or none
++	// of them are created.
++	PlanBuild(context.Context, *api.Build, []*api.Service, []*api.Step, FinalizeBuildExecutable) (*PlanBuildResult, error)
++
+ 	// SettingsInterface defines the interface for platform settings stored in the database.
+ 	settings.SettingsInterface
+ 
+diff --git a/database/plan.go b/database/plan.go
+new file mode 100644
+index 00000000..bc3188f1
+--- /dev/null
++++ b/database/plan.go
+@@ -0,0 +1,257 @@
++// SPDX-License-Identifier: Apache-2.0
++
++package database
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	"github.com/sirupsen/logrus"
++	"gorm.io/gorm"
++
++	api "github.com/go-vela/server/api/types"
++	"github.com/go-vela/server/constants"
++	dbtypes "github.com/go-vela/server/database/types"
++)
++
++// FinalizeBuildExecutable defines a function that is invoked within the
++// planning transaction after the build, services, and steps have been inserted.
++//
++// The build passed to the function carries its final ID and number, so the
++// returned marshaled executable data may include build-scoped values such as
++// the SCM build token. Returning an error rolls back the entire planning
++// transaction, leaving no build or child resources behind.
++type FinalizeBuildExecutable func(b *api.Build, services []*api.Service, steps []*api.Step) ([]byte, error)
++
++// PlanBuildResult is the set of resources created by a successful
++// PlanBuild transaction.
++type PlanBuildResult struct {
++	// Build is the newly created build, populated with its ID and number.
++	Build *api.Build
++	// Services is the complete, ordered set of services created for the build.
++	Services []*api.Service
++	// Steps is the complete, ordered set of steps created for the build.
++	Steps []*api.Step
++}
++
++// PlanBuild atomically persists the complete set of resources required for a
++// build to be consumable: the build itself, every service, every step, the
++// empty log placeholder for each service and step, and the build executable.
++//
++// All of the inserts run inside a single database transaction. If any insert
++// fails, or if the finalizeExecutable callback returns an error, the
++// transaction is rolled back: the repo counter is not incremented and no
++// build, service, step, log, or executable rows are left behind. This
++// guarantees that a retry starts from a clean persisted state, can never
++// conflict with a build number from a failed attempt, and can never produce a
++// second set of child resources for the same build.
++//
++// Recovery after a crash or partial failure is therefore driven entirely by
++// the database transaction state - either every row for the build exists or
++// none do - instead of any in-process list of the objects that were created.
++func (e *engine) PlanBuild(ctx context.Context, b *api.Build, services []*api.Service, steps []*api.Step, finalizeExecutable FinalizeBuildExecutable) (*PlanBuildResult, error) {
++	logger := e.logger.WithFields(logrus.Fields{
++		"org":     b.GetRepo().GetOrg(),
++		"repo":    b.GetRepo().GetName(),
++		"repo_id": b.GetRepo().GetID(),
++	})
++
++	logger.Trace("planning build")
++
++	var (
++		buildID int64
++		number  int64
++		result  = new(PlanBuildResult)
++	)
++
++	err := e.client.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
++		r := b.GetRepo()
++
++		if r.GetID() == 0 {
++			return fmt.Errorf("repo ID must be set")
++		}
++
++		// assign the next build number by incrementing the counter for the repo
++		err := tx.Raw("UPDATE repos SET counter = counter + 1 WHERE id = ? RETURNING counter", r.GetID()).Scan(&number).Error
++		if err != nil {
++			return err
++		}
++
++		b.SetNumber(number)
++
++		// insert the build
++		dbBuild := dbtypes.BuildFromAPI(b)
++
++		err = dbBuild.Validate()
++		if err != nil {
++			return err
++		}
++
++		dbBuild = dbBuild.Crop()
++
++		err = tx.Table(constants.TableBuild).Create(dbBuild).Error
++		if err != nil {
++			return err
++		}
++
++		buildID = dbBuild.ID.Int64
++
++		b.SetID(buildID)
++
++		// insert every service with its empty log placeholder
++		plannedServices := make([]*api.Service, 0, len(services))
++
++		for _, s := range services {
++			s.SetBuildID(buildID)
++			s.SetRepoID(r.GetID())
++
++			dbService := dbtypes.ServiceFromAPI(s)
++
++			err = dbService.Validate()
++			if err != nil {
++				return fmt.Errorf("unable to create service %s: %w", s.GetName(), err)
++			}
++
++			err = tx.Table(constants.TableService).Create(dbService).Error
++			if err != nil {
++				return fmt.Errorf("unable to create service %s: %w", s.GetName(), err)
++			}
++
++			s.SetID(dbService.ID.Int64)
++
++			err = createPlanLog(tx, e.config.CompressionLevel, s.GetID(), 0, buildID, r.GetID())
++			if err != nil {
++				return fmt.Errorf("unable to create service logs for service %s: %w", s.GetName(), err)
++			}
++
++			plannedServices = append(plannedServices, s)
++		}
++
++		// insert every step with its empty log placeholder
++		plannedSteps := make([]*api.Step, 0, len(steps))
++
++		for _, s := range steps {
++			s.SetBuildID(buildID)
++			s.SetRepoID(r.GetID())
++
++			dbStep := dbtypes.StepFromAPI(s)
++
++			err = dbStep.Validate()
++			if err != nil {
++				return fmt.Errorf("unable to create step %s: %w", s.GetName(), err)
++			}
++
++			err = tx.Table(constants.TableStep).Create(dbStep).Error
++			if err != nil {
++				return fmt.Errorf("unable to create step %s: %w", s.GetName(), err)
++			}
++
++			s.SetID(dbStep.ID.Int64)
++
++			err = createPlanLog(tx, e.config.CompressionLevel, 0, s.GetID(), buildID, r.GetID())
++			if err != nil {
++				return fmt.Errorf("unable to create logs for step %s: %w", s.GetName(), err)
++			}
++
++			plannedSteps = append(plannedSteps, s)
++		}
++
++		// build and insert the executable while the transaction is open so
++		// the build only becomes consumable if the executable exists as well
++		executableData, err := finalizeExecutable(b, plannedServices, plannedSteps)
++		if err != nil {
++			return err
++		}
++
++		dbExecutable := new(api.BuildExecutable)
++		dbExecutable.SetBuildID(buildID)
++		dbExecutable.SetData(executableData)
++
++		executable := dbtypes.BuildExecutableFromAPI(dbExecutable)
++
++		err = executable.Validate()
++		if err != nil {
++			return err
++		}
++
++		err = executable.Compress(e.config.CompressionLevel)
++		if err != nil {
++			return err
++		}
++
++		err = executable.Encrypt(e.config.EncryptionKey)
++		if err != nil {
++			return fmt.Errorf("unable to encrypt build executable for build %d: %w", buildID, err)
++		}
++
++		err = tx.Table(constants.TableBuildExecutable).Create(executable).Error
++		if err != nil {
++			return fmt.Errorf("unable to create build executable: %w", err)
++		}
++
++		result.Build = b
++		result.Services = plannedServices
++		result.Steps = plannedSteps
++
++		return nil
++	})
++	if err != nil {
++		// the transaction was rolled back so nothing was persisted. Reset the
++		// identifiers that were assigned during planning to ensure the caller
++		// does not carry a stale build number or child build IDs into a retry.
++		b.SetID(0)
++		b.SetNumber(0)
++
++		for _, s := range services {
++			s.SetID(0)
++			s.SetBuildID(0)
++		}
++
++		for _, s := range steps {
++			s.SetID(0)
++			s.SetBuildID(0)
++		}
++
++		return nil, err
++	}
++
++	// keep the in-memory repo counter consistent with the database
++	b.GetRepo().SetCounter(number)
++
++	logger.WithFields(logrus.Fields{
++		"build":    number,
++		"build_id": buildID,
++		"services": len(result.Services),
++		"steps":    len(result.Steps),
++	}).Info("build planned")
++
++	return result, nil
++}
++
++// createPlanLog inserts an empty log placeholder for a newly created service
++// or step using the provided transaction. Exactly one of serviceID or stepID
++// must be set.
++func createPlanLog(tx *gorm.DB, compressionLevel int, serviceID, stepID, buildID, repoID int64) error {
++	l := new(api.Log)
++	l.SetServiceID(serviceID)
++	l.SetStepID(stepID)
++	l.SetBuildID(buildID)
++	l.SetRepoID(repoID)
++	l.SetData([]byte{})
++	l.SetCreatedAt(time.Now().UTC().Unix())
++
++	dbLog := dbtypes.LogFromAPI(l)
++
++	err := dbLog.Validate()
++	if err != nil {
++		return err
++	}
++
++	err = dbLog.Compress(compressionLevel)
++	if err != nil {
++		return err
++	}
++
++	return tx.Table(constants.TableLog).Create(dbLog).Error
++}
+diff --git a/database/plan_test.go b/database/plan_test.go
+new file mode 100644
+index 00000000..6869b053
+--- /dev/null
++++ b/database/plan_test.go
+@@ -0,0 +1,445 @@
++// SPDX-License-Identifier: Apache-2.0
++
++package database
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"testing"
++	"time"
++
++	api "github.com/go-vela/server/api/types"
++	"github.com/go-vela/server/constants"
++	"github.com/go-vela/server/tracing"
++)
++
++// testPlanEngine creates an isolated in-memory sqlite engine for planning tests.
++func testPlanEngine(t *testing.T) Interface {
++	t.Helper()
++
++	// use a unique named in-memory database per test so shared-cache databases
++	// do not leak state between tests
++	name := sanitizeDSNName(t.Name())
++
++	db, err := New(
++		WithAddress(fmt.Sprintf("file:planbuild_%s?mode=memory&cache=shared", name)),
++		WithCompressionLevel(3),
++		WithConnectionLife(30*time.Minute),
++		WithConnectionIdle(2),
++		WithConnectionOpen(0),
++		WithDriver("sqlite3"),
++		WithEncryptionKey("A1B2C3D4E5G6H7I8J9K0LMNOPQRSTUVW"),
++		WithSkipCreation(false),
++		WithLogLevel("warn"),
++		WithLogShowSQL(false),
++		WithLogSkipNotFound(true),
++		WithLogSlowThreshold(200*time.Millisecond),
++		WithTracing(&tracing.Client{Config: tracing.Config{EnableTracing: false}}),
++	)
++	if err != nil {
++		t.Fatalf("unable to create test database engine: %v", err)
++	}
++
++	t.Cleanup(func() { _ = db.Close() })
++
++	return db
++}
++
++func sanitizeDSNName(name string) string {
++	out := make([]byte, 0, len(name))
++
++	for i := range len(name) {
++		c := name[i]
++		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
++			out = append(out, c)
++		} else {
++			out = append(out, '_')
++		}
++	}
++
++	return string(out)
++}
++
++// testPlanRepo creates a user and repo that can own planned builds.
++func testPlanRepo(t *testing.T, db Interface) *api.Repo {
++	t.Helper()
++
++	ctx := context.Background()
++
++	u := new(api.User)
++	u.SetName("octocat")
++	u.SetToken("superSecretToken")
++	u.SetRefreshToken("superSecretRefreshToken")
++	u.SetActive(true)
++	u.SetAdmin(false)
++
++	u, err := db.CreateUser(ctx, u)
++	if err != nil {
++		t.Fatalf("unable to create test user: %v", err)
++	}
++
++	r := new(api.Repo)
++	r.SetOwner(u)
++	r.SetHash("MzM4N2MzMDAtNmY4Mi00OTA5LWFhZDAtNWIzMTlkNTJkODMy")
++	r.SetOrg("github")
++	r.SetName("octocat")
++	r.SetFullName("github/octocat")
++	r.SetLink("https://github.com/github/octocat")
++	r.SetClone("https://github.com/github/octocat.git")
++	r.SetBranch("main")
++	r.SetBuildLimit(10)
++	r.SetTimeout(30)
++	r.SetCounter(0)
++	r.SetHookCounter(0)
++	r.SetVisibility("public")
++	r.SetActive(true)
++	r.SetPipelineType("")
++	r.SetApproveBuild(constants.ApproveNever)
++	r.SetAllowEvents(api.NewEventsFromMask(1))
++	r.SetMergeQueueEvents([]string{})
++	r.SetApprovalTimeout(7)
++
++	r, err = db.CreateRepo(ctx, r)
++	if err != nil {
++		t.Fatalf("unable to create test repo: %v", err)
++	}
++
++	return r
++}
++
++func testPlanBuild(r *api.Repo) *api.Build {
++	b := new(api.Build)
++	b.SetRepo(r)
++	b.SetEvent(constants.EventPush)
++	b.SetStatus(constants.StatusPending)
++	b.SetCommit("48afb5bdc41ad69bf22588491333f7cf71135163")
++	b.SetBranch("main")
++	b.SetRef("refs/heads/main")
++	b.SetCreated(time.Now().UTC().Unix())
++
++	return b
++}
++
++func testPlanServices(b *api.Build) []*api.Service {
++	services := make([]*api.Service, 2)
++
++	for i := range services {
++		s := new(api.Service)
++		s.SetBuildID(b.GetID())
++		s.SetRepoID(b.GetRepo().GetID())
++		s.SetNumber(int32(i + 1))
++		s.SetName(fmt.Sprintf("service_%d", i+1))
++		s.SetImage("alpine:latest")
++		s.SetStatus(constants.StatusPending)
++		s.SetCreated(time.Now().UTC().Unix())
++
++		services[i] = s
++	}
++
++	return services
++}
++
++func testPlanSteps(b *api.Build) []*api.Step {
++	steps := make([]*api.Step, 3)
++
++	for i := range steps {
++		s := new(api.Step)
++		s.SetBuildID(b.GetID())
++		s.SetRepoID(b.GetRepo().GetID())
++		s.SetNumber(int32(i + 1))
++		s.SetName(fmt.Sprintf("step_%d", i+1))
++		s.SetImage("alpine:latest")
++		s.SetStatus(constants.StatusPending)
++		s.SetCreated(time.Now().UTC().Unix())
++
++		steps[i] = s
++	}
++
++	return steps
++}
++
++// finalizeExecutable is the default successful finalizer used by the tests.
++func finalizeExecutable(data []byte, calls *int) FinalizeBuildExecutable {
++	return func(b *api.Build, _ []*api.Service, _ []*api.Step) ([]byte, error) {
++		if calls != nil {
++			*calls++
++		}
++
++		// the finalizer must run once the build has been assigned its identity
++		if b.GetID() == 0 || b.GetNumber() == 0 {
++			return nil, errors.New("finalizer invoked without a persisted build identity")
++		}
++
++		return data, nil
++	}
++}
++
++func TestEngine_PlanBuild_Success(t *testing.T) {
++	db := testPlanEngine(t)
++	r := testPlanRepo(t, db)
++	b := testPlanBuild(r)
++	services := testPlanServices(b)
++	steps := testPlanSteps(b)
++
++	executableData := []byte(`{"id":"plan-build-success"}`)
++
++	result, err := db.PlanBuild(context.Background(), b, services, steps, finalizeExecutable(executableData, nil))
++	if err != nil {
++		t.Fatalf("PlanBuild returned err: %v", err)
++	}
++
++	if result.Build.GetNumber() != 1 {
++		t.Errorf("build number = %d, want 1", result.Build.GetNumber())
++	}
++
++	if result.Build.GetID() == 0 {
++		t.Error("build ID should be populated")
++	}
++
++	if len(result.Services) != len(services) {
++		t.Errorf("planned services = %d, want %d", len(result.Services), len(services))
++	}
++
++	if len(result.Steps) != len(steps) {
++		t.Errorf("planned steps = %d, want %d", len(result.Steps), len(steps))
++	}
++
++	for _, s := range result.Services {
++		if s.GetID() == 0 {
++			t.Errorf("service %s should have an ID", s.GetName())
++		}
++
++		if s.GetBuildID() != result.Build.GetID() {
++			t.Errorf("service %s build_id = %d, want %d", s.GetName(), s.GetBuildID(), result.Build.GetID())
++		}
++	}
++
++	for _, s := range result.Steps {
++		if s.GetID() == 0 {
++			t.Errorf("step %s should have an ID", s.GetName())
++		}
++
++		if s.GetBuildID() != result.Build.GetID() {
++			t.Errorf("step %s build_id = %d, want %d", s.GetName(), s.GetBuildID(), result.Build.GetID())
++		}
++	}
++
++	// exactly one build should exist for the repo
++	count, err := db.CountBuilds(context.Background())
++	if err != nil {
++		t.Fatalf("CountBuilds returned err: %v", err)
++	}
++
++	if count != 1 {
++		t.Errorf("CountBuilds = %d, want 1", count)
++	}
++
++	// the repo counter should reflect the assigned number
++	gotRepo, err := db.GetRepo(context.Background(), r.GetID())
++	if err != nil {
++		t.Fatalf("GetRepo returned err: %v", err)
++	}
++
++	if gotRepo.GetCounter() != 1 {
++		t.Errorf("repo counter = %d, want 1", gotRepo.GetCounter())
++	}
++
++	// the full set of services, steps, and their logs should be readable
++	gotServices, err := db.ListServicesForBuild(context.Background(), result.Build, nil, 1, 100)
++	if err != nil {
++		t.Fatalf("ListServicesForBuild returned err: %v", err)
++	}
++
++	if len(gotServices) != len(services) {
++		t.Errorf("persisted services = %d, want %d", len(gotServices), len(services))
++	}
++
++	gotSteps, err := db.ListStepsForBuild(context.Background(), result.Build, nil, 1, 100)
++	if err != nil {
++		t.Fatalf("ListStepsForBuild returned err: %v", err)
++	}
++
++	if len(gotSteps) != len(steps) {
++		t.Errorf("persisted steps = %d, want %d", len(gotSteps), len(steps))
++	}
++
++	gotLogs, err := db.ListLogsForBuild(context.Background(), result.Build, 1, 100)
++	if err != nil {
++		t.Fatalf("ListLogsForBuild returned err: %v", err)
++	}
++
++	if len(gotLogs) != len(services)+len(steps) {
++		t.Errorf("persisted logs = %d, want %d", len(gotLogs), len(services)+len(steps))
++	}
++
++	// the executable should be present and round-trip through the pop path,
++	// which decrypts and decompresses the data
++	gotExecutable, err := db.PopBuildExecutable(context.Background(), result.Build.GetID())
++	if err != nil {
++		t.Fatalf("PopBuildExecutable returned err: %v", err)
++	}
++
++	if string(gotExecutable.GetData()) != string(executableData) {
++		t.Errorf("executable data = %s, want %s", string(gotExecutable.GetData()), string(executableData))
++	}
++}
++
++func TestEngine_PlanBuild_FinalizeErrorRollsBack(t *testing.T) {
++	db := testPlanEngine(t)
++	r := testPlanRepo(t, db)
++	b := testPlanBuild(r)
++	services := testPlanServices(b)
++	steps := testPlanSteps(b)
++
++	finalizeCalls := 0
++
++	failingFinalize := func(_ *api.Build, _ []*api.Service, _ []*api.Step) ([]byte, error) {
++		finalizeCalls++
++
++		return nil, errors.New("unable to marshal build executable")
++	}
++
++	result, err := db.PlanBuild(context.Background(), b, services, steps, failingFinalize)
++	if err == nil {
++		t.Fatal("PlanBuild should have returned err for failing finalizer")
++	}
++
++	if result != nil {
++		t.Fatal("PlanBuild should not return a result on failure")
++	}
++
++	if finalizeCalls != 1 {
++		t.Errorf("failing finalizer calls = %d, want 1", finalizeCalls)
++	}
++
++	// nothing should have been committed
++	count, err := db.CountBuilds(context.Background())
++	if err != nil {
++		t.Fatalf("CountBuilds returned err: %v", err)
++	}
++
++	if count != 0 {
++		t.Errorf("CountBuilds after rollback = %d, want 0", count)
++	}
++
++	gotRepo, err := db.GetRepo(context.Background(), r.GetID())
++	if err != nil {
++		t.Fatalf("GetRepo returned err: %v", err)
++	}
++
++	if gotRepo.GetCounter() != 0 {
++		t.Errorf("repo counter after rollback = %d, want 0", gotRepo.GetCounter())
++	}
++
++	// identifiers assigned in memory must be reset so the caller can retry
++	if b.GetID() != 0 || b.GetNumber() != 0 {
++		t.Errorf("build identity after rollback = (%d,%d), want (0,0)", b.GetID(), b.GetNumber())
++	}
++
++	for _, s := range services {
++		if s.GetID() != 0 || s.GetBuildID() != 0 {
++			t.Errorf("service %s identity after rollback = (%d,%d), want (0,0)", s.GetName(), s.GetID(), s.GetBuildID())
++		}
++	}
++
++	for _, s := range steps {
++		if s.GetID() != 0 || s.GetBuildID() != 0 {
++			t.Errorf("step %s identity after rollback = (%d,%d), want (0,0)", s.GetName(), s.GetID(), s.GetBuildID())
++		}
++	}
++
++	// retrying with fresh child resources must converge on a single build with
++	// a single set of children and a single executable
++	b = testPlanBuild(r)
++
++	retryServices := testPlanServices(b)
++	retrySteps := testPlanSteps(b)
++
++	executableData := []byte(`{"id":"plan-build-retry"}`)
++
++	retryResult, err := db.PlanBuild(context.Background(), b, retryServices, retrySteps, finalizeExecutable(executableData, nil))
++	if err != nil {
++		t.Fatalf("retry PlanBuild returned err: %v", err)
++	}
++
++	if retryResult.Build.GetNumber() != 1 {
++		t.Errorf("retry build number = %d, want 1", retryResult.Build.GetNumber())
++	}
++
++	count, err = db.CountBuilds(context.Background())
++	if err != nil {
++		t.Fatalf("CountBuilds after retry returned err: %v", err)
++	}
++
++	if count != 1 {
++		t.Errorf("CountBuilds after retry = %d, want 1", count)
++	}
++
++	gotServices, err := db.ListServicesForBuild(context.Background(), retryResult.Build, nil, 1, 100)
++	if err != nil {
++		t.Fatalf("ListServicesForBuild returned err: %v", err)
++	}
++
++	if len(gotServices) != len(retryServices) {
++		t.Errorf("retry services = %d, want %d", len(gotServices), len(retryServices))
++	}
++
++	gotSteps, err := db.ListStepsForBuild(context.Background(), retryResult.Build, nil, 1, 100)
++	if err != nil {
++		t.Fatalf("ListStepsForBuild returned err: %v", err)
++	}
++
++	if len(gotSteps) != len(retrySteps) {
++		t.Errorf("retry steps = %d, want %d", len(gotSteps), len(retrySteps))
++	}
++
++	gotLogs, err := db.ListLogsForBuild(context.Background(), retryResult.Build, 1, 100)
++	if err != nil {
++		t.Fatalf("ListLogsForBuild returned err: %v", err)
++	}
++
++	if len(gotLogs) != len(retryServices)+len(retrySteps) {
++		t.Errorf("retry logs = %d, want %d", len(gotLogs), len(retryServices)+len(retrySteps))
++	}
++
++	_, err = db.PopBuildExecutable(context.Background(), retryResult.Build.GetID())
++	if err != nil {
++		t.Fatalf("retry PopBuildExecutable returned err: %v", err)
++	}
++}
++
++func TestEngine_PlanBuild_InvalidChildRollsBack(t *testing.T) {
++	db := testPlanEngine(t)
++	r := testPlanRepo(t, db)
++	b := testPlanBuild(r)
++	services := testPlanServices(b)
++	steps := testPlanSteps(b)
++
++	// an invalid service (missing image) fails validation inside the transaction
++	services[1].SetImage("")
++
++	finalizeCalls := 0
++
++	result, err := db.PlanBuild(context.Background(), b, services, steps, finalizeExecutable([]byte(`{}`), &finalizeCalls))
++	if err == nil {
++		t.Fatal("PlanBuild should have returned err for an invalid service")
++	}
++
++	if result != nil {
++		t.Fatal("PlanBuild should not return a result on failure")
++	}
++
++	if finalizeCalls != 0 {
++		t.Errorf("finalizer should not have been invoked, got %d calls", finalizeCalls)
++	}
++
++	count, err := db.CountBuilds(context.Background())
++	if err != nil {
++		t.Fatalf("CountBuilds returned err: %v", err)
++	}
++
++	if count != 0 {
++		t.Errorf("CountBuilds after rollback = %d, want 0", count)
++	}
++}

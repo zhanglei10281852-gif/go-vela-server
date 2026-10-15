@@ -390,14 +390,21 @@ func CompileAndPublish(
 
 		b.SetPipelineID(pipeline.GetID())
 
-		// create the objects from the pipeline in the database
-		// TODO:
-		// - if a build gets created and something else fails midway,
-		//   the next loop will attempt to create the same build,
-		//   using the same Number and thus create a constraint
-		//   conflict; consider deleting the partially created
-		//   build object in the database
-		b, err = PlanBuild(ctx, database, scm, p, b, r)
+		// determine the queue route before persisting any build resources so a
+		// routing validation failure leaves no build or child resources behind
+		route, routeErr := queue.Route(&p.Worker)
+		if routeErr != nil {
+			retErr := fmt.Errorf("unable to set route for %s: %w", r.GetFullName(), routeErr)
+
+			return nil, nil, http.StatusBadRequest, retErr
+		}
+
+		b.SetRoute(route)
+
+		// atomically create the build, all services, all steps, their logs, and
+		// the build executable. On failure nothing is committed, so the next
+		// attempt cannot conflict with a build number or duplicate children.
+		b, err = PlanBuild(ctx, database, cache, scm, p, b, r)
 		if err != nil {
 			retErr := fmt.Errorf("%s: %w", baseErr, err)
 
@@ -405,7 +412,11 @@ func CompileAndPublish(
 			if i < cfg.Retries-1 {
 				logger.WithError(retErr).Warningf("retrying #%d", i+1)
 
-				// reset fields set by cleanBuild for retry
+				// reset build fields for a fresh planning attempt; the failed
+				// attempt left no committed build, so clear any identifiers it
+				// assigned in memory before retrying
+				b.SetID(0)
+				b.SetNumber(0)
 				b.SetError("")
 				b.SetStatus(constants.StatusPending)
 				b.SetFinished(0)
@@ -448,47 +459,9 @@ func CompileAndPublish(
 		return nil, nil, http.StatusInternalServerError, retErr
 	}
 
-	var (
-		scmRepos []string
-		scmPerms map[string]string
-	)
-
-	if p.Git != nil {
-		scmRepos = p.Git.Token.Repositories
-		scmPerms = p.Git.Token.Permissions
-	}
-
-	scmBuildToken, scmBuildTokenExp, err := scm.GetNetrcPassword(ctx, database, cache, b, scmRepos, scmPerms)
-	if err != nil {
-		retErr := fmt.Errorf("%s: failed to get SCM build token for %s: %w", baseErr, r.GetFullName(), err)
-
-		return nil, nil, http.StatusInternalServerError, retErr
-	}
-
-	p.Token = scmBuildToken
-	p.TokenExp = scmBuildTokenExp
-
-	// determine queue route
-	route, err := queue.Route(&p.Worker)
-	if err != nil {
-		retErr := fmt.Errorf("unable to set route for build %d for %s: %w", b.GetNumber(), r.GetFullName(), err)
-
-		// error out the build
-		CleanBuild(ctx, database, b, nil, nil, retErr)
-
-		return nil, nil, http.StatusBadRequest, retErr
-	}
-
-	b.SetRoute(route)
-
-	// publish the pipeline.Build to the build_executables table to be requested by a worker
-	err = PublishBuildExecutable(ctx, database, p, b)
-	if err != nil {
-		retErr := fmt.Errorf("unable to publish build executable for %s/%d: %w", r.GetFullName(), b.GetNumber(), err)
-
-		return nil, nil, http.StatusInternalServerError, retErr
-	}
-
+	// the build, services, steps, logs, and build executable were committed
+	// together by PlanBuild, so the queue item now points at a fully
+	// consumable build
 	return p, models.ToItem(b), http.StatusCreated, nil
 }
 

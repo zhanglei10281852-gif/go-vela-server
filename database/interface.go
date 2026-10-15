@@ -3,6 +3,9 @@
 package database
 
 import (
+	"context"
+
+	api "github.com/go-vela/server/api/types"
 	"github.com/go-vela/server/database/build"
 	"github.com/go-vela/server/database/dashboard"
 	"github.com/go-vela/server/database/deployment"
@@ -38,6 +41,12 @@ type Interface interface {
 	IsLogPartitioned() bool
 
 	// Resource Interface Functions
+
+	// PlanBuild defines a function that atomically creates a build together
+	// with all of its services, steps, logs, and build executable inside a
+	// single transaction. Either every resource is committed together or none
+	// of them are created.
+	PlanBuild(context.Context, *api.Build, []*api.Service, []*api.Step, FinalizeBuildExecutable) (*PlanBuildResult, error)
 
 	// SettingsInterface defines the interface for platform settings stored in the database.
 	settings.SettingsInterface
