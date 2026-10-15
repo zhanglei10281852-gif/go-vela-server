@@ -1,0 +1,2682 @@
+diff --git a/api/admin/worker.go b/api/admin/worker.go
+index 95537581..ba2ae0a6 100644
+--- a/api/admin/worker.go
++++ b/api/admin/worker.go
+@@ -5,12 +5,15 @@ package admin
+ import (
+ 	"fmt"
+ 	"net/http"
++	"time"
+ 
+ 	"github.com/gin-gonic/gin"
++	"github.com/google/uuid"
+ 	"github.com/sirupsen/logrus"
+ 
+ 	"github.com/go-vela/server/api/types"
+ 	"github.com/go-vela/server/constants"
++	"github.com/go-vela/server/database"
+ 	"github.com/go-vela/server/internal/token"
+ 	"github.com/go-vela/server/util"
+ )
+@@ -47,22 +50,65 @@ import (
+ // RegisterToken represents the API handler to
+ // generate a registration token for onboarding a worker.
+ func RegisterToken(c *gin.Context) {
++	// capture middleware values
+ 	l := c.MustGet("logger").(*logrus.Entry)
++	ctx := c.Request.Context()
+ 
+ 	// capture middleware values
+ 	host := util.PathParameter(c, "worker")
+ 
++	// a register token authorizes exactly one registration, which
++	// establishes exactly one worker lifecycle generation. the random
++	// token identifier is the generation identifier recorded on the
++	// worker row when registration succeeds and embedded in every auth
++	// token minted for that generation.
++	tokenID, err := uuid.NewV7()
++	if err != nil {
++		retErr := fmt.Errorf("unable to generate worker registration identifier: %w", err)
++
++		util.HandleError(c, http.StatusInternalServerError, retErr)
++
++		return
++	}
++
+ 	tm := c.MustGet("token-manager").(*token.Manager)
++
++	now := time.Now()
++
++	// persist the single-use registration before handing out the token
++	registerToken := new(types.WorkerRegisterToken)
++	registerToken.SetTokenID(tokenID.String())
++	registerToken.SetHostname(host)
++	registerToken.SetStatus(constants.WorkerRegisterTokenStatusActive)
++	registerToken.SetCreatedAt(now.Unix())
++	registerToken.SetExpiresAt(now.Add(tm.WorkerRegisterTokenDuration).Unix())
++
++	_, err = database.FromContext(c).CreateWorkerRegisterToken(ctx, registerToken)
++	if err != nil {
++		retErr := fmt.Errorf("unable to store worker registration token: %w", err)
++
++		util.HandleError(c, http.StatusInternalServerError, retErr)
++
++		return
++	}
++
+ 	rmto := &token.MintTokenOpts{
+ 		Hostname:      host,
+ 		TokenType:     constants.WorkerRegisterTokenType,
+ 		TokenDuration: tm.WorkerRegisterTokenDuration,
++		Generation:    tokenID.String(),
+ 	}
+ 
+ 	l.Debug("platform admin: generating worker registration token")
+ 
+ 	rt, err := tm.MintToken(rmto)
+ 	if err != nil {
++		// do not leave a dangling registration the worker can never
++		// complete; the admin can simply request a new token
++		if dErr := database.FromContext(c).DeleteWorkerRegisterToken(ctx, tokenID.String()); dErr != nil {
++			l.WithError(dErr).Warn("unable to remove worker registration record after mint failure")
++		}
++
+ 		retErr := fmt.Errorf("unable to generate registration token: %w", err)
+ 
+ 		util.HandleError(c, http.StatusInternalServerError, retErr)
+@@ -70,7 +116,10 @@ func RegisterToken(c *gin.Context) {
+ 		return
+ 	}
+ 
+-	l.Infof("platform admin: generated worker registration token for %s", host)
++	l.WithFields(logrus.Fields{
++		"worker":     host,
++		"generation": tokenID.String(),
++	}).Info("platform admin: generated worker registration token")
+ 
+ 	c.JSON(http.StatusOK, types.Token{Token: &rt})
+ }
+diff --git a/api/admin/worker_test.go b/api/admin/worker_test.go
+new file mode 100644
+index 00000000..6cf4d80a
+--- /dev/null
++++ b/api/admin/worker_test.go
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: Apache-2.0
++
++package admin
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/gin-gonic/gin"
++	"github.com/sirupsen/logrus"
++
++	apitypes "github.com/go-vela/server/api/types"
++	"github.com/go-vela/server/constants"
++	"github.com/go-vela/server/database"
++	"github.com/go-vela/server/internal/token"
++)
++
++// TestAdmin_RegisterToken verifies the admin handler records a
++// single-use registration scoped to a generation and embeds that
++// generation in the signed register token.
++func TestAdmin_RegisterToken(t *testing.T) {
++	// setup database
++	db, err := database.NewTest()
++	if err != nil {
++		t.Fatalf("unable to create test database engine: %v", err)
++	}
++	defer db.Close()
++
++	tm := &token.Manager{
++		PrivateKeyHMAC:              "admin-register-token-hmac",
++		WorkerRegisterTokenDuration: 30 * time.Minute,
++	}
++
++	gin.SetMode(gin.TestMode)
++
++	resp := httptest.NewRecorder()
++	c, engine := gin.CreateTestContext(resp)
++	c.Request, _ = http.NewRequestWithContext(context.Background(), http.MethodPost, "/admin/workers/my-worker/register", nil)
++
++	engine.Use(func(gc *gin.Context) { gc.Set("logger", logrus.NewEntry(logrus.StandardLogger())) })
++	engine.Use(func(gc *gin.Context) { database.ToContext(gc, db) })
++	engine.Use(func(gc *gin.Context) { gc.Set("token-manager", tm) })
++	engine.POST("/admin/workers/:worker/register", RegisterToken)
++
++	engine.ServeHTTP(resp, c.Request)
++
++	if resp.Code != http.StatusOK {
++		t.Fatalf("RegisterToken returned %d: %s", resp.Code, resp.Body.String())
++	}
++
++	tkn := new(apitypes.Token)
++
++	err = json.Unmarshal(resp.Body.Bytes(), tkn)
++	if err != nil {
++		t.Fatalf("unable to decode token response: %v", err)
++	}
++
++	claims, err := tm.ParseToken(tkn.GetToken())
++	if err != nil {
++		t.Fatalf("unable to parse register token: %v", err)
++	}
++
++	if claims.TokenType != constants.WorkerRegisterTokenType {
++		t.Errorf("token type is %s, want %s", claims.TokenType, constants.WorkerRegisterTokenType)
++	}
++
++	if claims.Subject != "my-worker" {
++		t.Errorf("token subject is %s, want my-worker", claims.Subject)
++	}
++
++	if len(claims.Generation) == 0 {
++		t.Fatal("register token should carry a generation")
++	}
++
++	// the single-use registration must be recorded and active
++	record, err := db.GetWorkerRegisterToken(context.Background(), claims.Generation)
++	if err != nil {
++		t.Fatalf("register token record not found: %v", err)
++	}
++
++	if record.GetHostname() != "my-worker" {
++		t.Errorf("record hostname is %s, want my-worker", record.GetHostname())
++	}
++
++	if record.GetStatus() != constants.WorkerRegisterTokenStatusActive {
++		t.Errorf("record status is %s, want %s", record.GetStatus(), constants.WorkerRegisterTokenStatusActive)
++	}
++
++	if record.GetExpiresAt() <= time.Now().Unix() {
++		t.Errorf("record expiration %d should be in the future", record.GetExpiresAt())
++	}
++}
+diff --git a/api/types/worker.go b/api/types/worker.go
+index f0dd0cf6..27f092ff 100644
+--- a/api/types/worker.go
++++ b/api/types/worker.go
+@@ -22,6 +22,13 @@ type Worker struct {
+ 	LastBuildFinishedAt *int64    `json:"last_build_finished_at,omitempty"`
+ 	LastCheckedIn       *int64    `json:"last_checked_in,omitempty"`
+ 	BuildLimit          *int32    `json:"build_limit,omitempty"`
++
++	// Generation identifies the worker lifecycle generation this record
++	// belongs to. It is established at registration and must match the
++	// generation claim on every worker auth token. It is never exposed
++	// through the API and is empty for the shared symmetric token mode
++	// and workers created before generations existed.
++	Generation *string `json:"-"`
+ }
+ 
+ // GetID returns the ID field.
+@@ -180,6 +187,19 @@ func (w *Worker) GetBuildLimit() int32 {
+ 	return *w.BuildLimit
+ }
+ 
++// GetGeneration returns the Generation field.
++//
++// When the provided Worker type is nil, or the field within
++// the type is nil, it returns the zero value for the field.
++func (w *Worker) GetGeneration() string {
++	// return zero value if Worker type or Generation field is nil
++	if w == nil || w.Generation == nil {
++		return ""
++	}
++
++	return *w.Generation
++}
++
+ // SetID sets the ID field.
+ //
+ // When the provided Worker type is nil, it
+@@ -336,6 +356,19 @@ func (w *Worker) SetBuildLimit(v int32) {
+ 	w.BuildLimit = &v
+ }
+ 
++// SetGeneration sets the Generation field.
++//
++// When the provided Worker type is nil, it
++// will set nothing and immediately return.
++func (w *Worker) SetGeneration(v string) {
++	// return if Worker type is nil
++	if w == nil {
++		return
++	}
++
++	w.Generation = &v
++}
++
+ // String implements the Stringer interface for the Worker type.
+ func (w *Worker) String() string {
+ 	return fmt.Sprintf(`{
+diff --git a/api/types/worker_register_token.go b/api/types/worker_register_token.go
+new file mode 100644
+index 00000000..92f10ca4
+--- /dev/null
++++ b/api/types/worker_register_token.go
+@@ -0,0 +1,150 @@
++// SPDX-License-Identifier: Apache-2.0
++
++package types
++
++// WorkerRegisterToken is the internal representation of a single-use
++// worker registration token.
++//
++// Each register token authorizes exactly one registration for a single
++// worker hostname and establishes exactly one worker lifecycle
++// generation. After the generation has been established the token is
++// marked as used and cannot establish any other generation; deleting
++// the worker revokes every register token issued for that hostname.
++//
++// This type is never exposed through the API.
++type WorkerRegisterToken struct {
++	ID        int64  `json:"-"`
++	TokenID   string `json:"-"`
++	Hostname  string `json:"-"`
++	Status    string `json:"-"`
++	WorkerID  int64  `json:"-"`
++	ExpiresAt int64  `json:"-"`
++	CreatedAt int64  `json:"-"`
++}
++
++// GetID returns the ID field.
++func (r *WorkerRegisterToken) GetID() int64 {
++	if r == nil {
++		return 0
++	}
++
++	return r.ID
++}
++
++// GetTokenID returns the TokenID field. This is the opaque generation
++// identifier embedded in the signed register token.
++func (r *WorkerRegisterToken) GetTokenID() string {
++	if r == nil {
++		return ""
++	}
++
++	return r.TokenID
++}
++
++// GetHostname returns the Hostname field.
++func (r *WorkerRegisterToken) GetHostname() string {
++	if r == nil {
++		return ""
++	}
++
++	return r.Hostname
++}
++
++// GetStatus returns the Status field.
++func (r *WorkerRegisterToken) GetStatus() string {
++	if r == nil {
++		return ""
++	}
++
++	return r.Status
++}
++
++// GetWorkerID returns the ID of the worker row that consumed the token.
++func (r *WorkerRegisterToken) GetWorkerID() int64 {
++	if r == nil {
++		return 0
++	}
++
++	return r.WorkerID
++}
++
++// GetExpiresAt returns the ExpiresAt field.
++func (r *WorkerRegisterToken) GetExpiresAt() int64 {
++	if r == nil {
++		return 0
++	}
++
++	return r.ExpiresAt
++}
++
++// GetCreatedAt returns the CreatedAt field.
++func (r *WorkerRegisterToken) GetCreatedAt() int64 {
++	if r == nil {
++		return 0
++	}
++
++	return r.CreatedAt
++}
++
++// SetID sets the ID field.
++func (r *WorkerRegisterToken) SetID(v int64) {
++	if r == nil {
++		return
++	}
++
++	r.ID = v
++}
++
++// SetTokenID sets the TokenID field.
++func (r *WorkerRegisterToken) SetTokenID(v string) {
++	if r == nil {
++		return
++	}
++
++	r.TokenID = v
++}
++
++// SetHostname sets the Hostname field.
++func (r *WorkerRegisterToken) SetHostname(v string) {
++	if r == nil {
++		return
++	}
++
++	r.Hostname = v
++}
++
++// SetStatus sets the Status field.
++func (r *WorkerRegisterToken) SetStatus(v string) {
++	if r == nil {
++		return
++	}
++
++	r.Status = v
++}
++
++// SetWorkerID sets the WorkerID field.
++func (r *WorkerRegisterToken) SetWorkerID(v int64) {
++	if r == nil {
++		return
++	}
++
++	r.WorkerID = v
++}
++
++// SetExpiresAt sets the ExpiresAt field.
++func (r *WorkerRegisterToken) SetExpiresAt(v int64) {
++	if r == nil {
++		return
++	}
++
++	r.ExpiresAt = v
++}
++
++// SetCreatedAt sets the CreatedAt field.
++func (r *WorkerRegisterToken) SetCreatedAt(v int64) {
++	if r == nil {
++		return
++	}
++
++	r.CreatedAt = v
++}
+diff --git a/api/worker/create.go b/api/worker/create.go
+index 9437f47d..e2890ae2 100644
+--- a/api/worker/create.go
++++ b/api/worker/create.go
+@@ -3,6 +3,7 @@
+ package worker
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"net/http"
+ 	"strings"
+@@ -14,6 +15,7 @@ import (
+ 	"github.com/go-vela/server/api/types"
+ 	"github.com/go-vela/server/constants"
+ 	"github.com/go-vela/server/database"
++	dbworker "github.com/go-vela/server/database/worker"
+ 	"github.com/go-vela/server/internal/token"
+ 	"github.com/go-vela/server/router/middleware/claims"
+ 	"github.com/go-vela/server/util"
+@@ -48,6 +50,10 @@ import (
+ //     description: Unauthorized
+ //     schema:
+ //       "$ref": "#/definitions/Error"
++//   '409':
++//     description: Worker with the hostname already exists
++//     schema:
++//       "$ref": "#/definitions/Error"
+ //   '500':
+ //     description: Unexpected server error
+ //     schema:
+@@ -86,23 +92,22 @@ func CreateWorker(c *gin.Context) {
+ 
+ 	l.Debugf("creating new worker %s", input.GetHostname())
+ 
+-	w, err := database.FromContext(c).CreateWorker(ctx, input)
+-	if err != nil {
+-		retErr := fmt.Errorf("unable to create worker: %w", err)
+-
+-		util.HandleError(c, http.StatusInternalServerError, retErr)
++	switch cl.TokenType {
++	// if symmetric token configured, send back symmetric token and
++	// register without a lifecycle generation
++	case constants.ServerWorkerTokenType:
++		w, err := database.FromContext(c).CreateWorker(ctx, input)
++		if err != nil {
++			util.HandleError(c, createWorkerErrorStatus(err), fmt.Errorf("unable to create worker: %w", err))
+ 
+-		return
+-	}
++			return
++		}
+ 
+-	l.WithFields(logrus.Fields{
+-		"worker":    w.GetHostname(),
+-		"worker_id": w.GetID(),
+-	}).Info("worker created")
++		l.WithFields(logrus.Fields{
++			"worker":    w.GetHostname(),
++			"worker_id": w.GetID(),
++		}).Info("worker created")
+ 
+-	switch cl.TokenType {
+-	// if symmetric token configured, send back symmetric token
+-	case constants.ServerWorkerTokenType:
+ 		if secret, ok := c.Value("secret").(string); ok {
+ 			tkn := new(types.Token)
+ 			tkn.SetToken(secret)
+@@ -116,18 +121,64 @@ func CreateWorker(c *gin.Context) {
+ 		util.HandleError(c, http.StatusBadRequest, retErr)
+ 
+ 		return
+-	// if worker register token, send back auth token
++
++	// a worker register token establishes exactly one worker generation
+ 	default:
++		// the register token must carry the generation it is authorized
++		// to establish; tokens issued before generations existed cannot
++		// establish a bound generation
++		if len(cl.Generation) == 0 {
++			retErr := fmt.Errorf("unable to add worker; registration token has no generation")
++
++			util.HandleError(c, http.StatusUnauthorized, retErr)
++
++			return
++		}
++
++		// verify the server-side, single-use registration record exists,
++		// is still active and unexpired, and belongs to this hostname.
++		// this is what prevents replayed or revoked register tokens from
++		// establishing generations after a delete/recreate cycle
++		registerToken, err := database.FromContext(c).GetWorkerRegisterToken(ctx, cl.Generation)
++		if err != nil {
++			l.Warnf("rejected registration for %s with unknown generation %s", input.GetHostname(), cl.Generation)
++
++			retErr := fmt.Errorf("unable to add worker; invalid registration token: %w", err)
++
++			util.HandleError(c, http.StatusUnauthorized, retErr)
++
++			return
++		}
++
++		if registerToken.GetStatus() != constants.WorkerRegisterTokenStatusActive ||
++			!strings.EqualFold(registerToken.GetHostname(), input.GetHostname()) ||
++			registerToken.GetExpiresAt() <= time.Now().Unix() {
++			l.WithFields(logrus.Fields{
++				"status": registerToken.GetStatus(),
++			}).Warnf("rejected registration for %s with consumed, expired, or mismatched generation %s", input.GetHostname(), cl.Generation)
++
++			retErr := fmt.Errorf("unable to add worker; registration token is consumed, expired, or not valid for worker %s", input.GetHostname())
++
++			util.HandleError(c, http.StatusUnauthorized, retErr)
++
++			return
++		}
++
++		// bind the new worker record to this generation
++		input.SetGeneration(cl.Generation)
++
+ 		tm := c.MustGet("token-manager").(*token.Manager)
+ 
+ 		wmto := &token.MintTokenOpts{
+ 			TokenType:     constants.WorkerAuthTokenType,
+ 			TokenDuration: tm.WorkerAuthTokenDuration,
+ 			Hostname:      cl.Subject,
++			Generation:    cl.Generation,
+ 		}
+ 
+-		tkn := new(types.Token)
+-
++		// mint the auth token before the worker record is created. if
++		// minting fails, no incomplete generation is left behind holding
++		// the hostname, and the worker can simply retry registration
+ 		wt, err := tm.MintToken(wmto)
+ 		if err != nil {
+ 			retErr := fmt.Errorf("unable to generate auth token for worker %s: %w", input.GetHostname(), err)
+@@ -137,8 +188,47 @@ func CreateWorker(c *gin.Context) {
+ 			return
+ 		}
+ 
++		// create the worker and consume the register token atomically
++		w, err := database.FromContext(c).CreateWorker(ctx, input)
++		if err != nil {
++			util.HandleError(c, createWorkerErrorStatus(err), fmt.Errorf("unable to create worker: %w", err))
++
++			return
++		}
++
++		l.WithFields(logrus.Fields{
++			"worker":     w.GetHostname(),
++			"worker_id":  w.GetID(),
++			"generation": w.GetGeneration(),
++		}).Info("worker created")
++
++		tkn := new(types.Token)
+ 		tkn.SetToken(wt)
+ 
+ 		c.JSON(http.StatusCreated, tkn)
+ 	}
+ }
++
++// createWorkerErrorStatus maps worker creation failures to the
++// appropriate HTTP status. An invalid or consumed register token and a
++// superseded generation are client errors; a hostname already in use
++// is a conflict; everything else is a server error.
++func createWorkerErrorStatus(err error) int {
++	switch {
++	case errors.Is(err, dbworker.ErrInvalidWorkerRegisterToken):
++		return http.StatusUnauthorized
++	case isDuplicateKeyError(err):
++		return http.StatusConflict
++	default:
++		return http.StatusInternalServerError
++	}
++}
++
++// isDuplicateKeyError reports whether the error is a unique-constraint
++// violation from either supported database driver.
++func isDuplicateKeyError(err error) bool {
++	msg := strings.ToLower(err.Error())
++
++	return strings.Contains(msg, "duplicate key value violates unique constraint") ||
++		strings.Contains(msg, "unique constraint failed")
++}
+diff --git a/api/worker/delete.go b/api/worker/delete.go
+index a31ed9d4..e4d5e0d7 100644
+--- a/api/worker/delete.go
++++ b/api/worker/delete.go
+@@ -3,6 +3,7 @@
+ package worker
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"net/http"
+ 
+@@ -10,6 +11,7 @@ import (
+ 	"github.com/sirupsen/logrus"
+ 
+ 	"github.com/go-vela/server/database"
++	dbworker "github.com/go-vela/server/database/worker"
+ 	"github.com/go-vela/server/router/middleware/worker"
+ 	"github.com/go-vela/server/util"
+ )
+@@ -60,9 +62,19 @@ func DeleteWorker(c *gin.Context) {
+ 
+ 	l.Debugf("deleting worker %s", w.GetHostname())
+ 
+-	// send API call to remove the step
++	// send API call to remove the worker and revoke all of its
++	// register tokens
+ 	err := database.FromContext(c).DeleteWorker(ctx, w)
+ 	if err != nil {
++		// the worker was already removed by a concurrent request
++		if errors.Is(err, dbworker.ErrStaleWorker) {
++			retErr := fmt.Errorf("unable to delete worker %s: %w", w.GetHostname(), err)
++
++			util.HandleError(c, http.StatusNotFound, retErr)
++
++			return
++		}
++
+ 		retErr := fmt.Errorf("unable to delete worker %s: %w", w.GetHostname(), err)
+ 
+ 		util.HandleError(c, http.StatusInternalServerError, retErr)
+diff --git a/api/worker/generation_test.go b/api/worker/generation_test.go
+new file mode 100644
+index 00000000..08902fd6
+--- /dev/null
++++ b/api/worker/generation_test.go
+@@ -0,0 +1,554 @@
++// SPDX-License-Identifier: Apache-2.0
++
++package worker
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/gin-gonic/gin"
++	"github.com/google/uuid"
++	"github.com/sirupsen/logrus"
++
++	apitypes "github.com/go-vela/server/api/types"
++	"github.com/go-vela/server/constants"
++	"github.com/go-vela/server/database"
++	"github.com/go-vela/server/internal/token"
++	"github.com/go-vela/server/router/middleware/claims"
++	"github.com/go-vela/server/router/middleware/perm"
++	usermw "github.com/go-vela/server/router/middleware/user"
++	wmw "github.com/go-vela/server/router/middleware/worker"
++)
++
++func testTokenManager() *token.Manager {
++	return &token.Manager{
++		PrivateKeyHMAC:              "worker-generation-test-hmac-secret",
++		WorkerAuthTokenDuration:     time.Hour,
++		WorkerRegisterTokenDuration: time.Hour,
++	}
++}
++
++// generationRouter wires the real worker middleware chain against an
++// in-memory database and the provided (optional) symmetric secret.
++func generationRouter(db database.Interface, tm *token.Manager, secret string) *gin.Engine {
++	gin.SetMode(gin.TestMode)
++
++	r := gin.New()
++	r.Use(func(c *gin.Context) { c.Set("logger", logrus.NewEntry(logrus.StandardLogger())) })
++	r.Use(func(c *gin.Context) { database.ToContext(c, db) })
++	r.Use(func(c *gin.Context) { c.Set("token-manager", tm) })
++
++	if len(secret) > 0 {
++		r.Use(func(c *gin.Context) { c.Set("secret", secret) })
++	}
++
++	r.Use(claims.Establish())
++	r.Use(usermw.Establish())
++
++	r.POST("/workers", perm.MustWorkerRegisterToken(), CreateWorker)
++
++	_worker := r.Group("/workers/:worker")
++	_worker.PUT("", perm.MustWorkerAuthToken(), wmw.Establish(), UpdateWorker)
++	_worker.POST("/refresh", perm.MustWorkerAuthToken(), wmw.Establish(), Refresh)
++	_worker.DELETE("", perm.MustPlatformAdmin(), wmw.Establish(), DeleteWorker)
++
++	return r
++}
++
++// issueRegisterToken stores a single-use server-side registration and
++// returns its generation and signed register token.
++func issueRegisterToken(t *testing.T, db database.Interface, tm *token.Manager, host string) (string, string) {
++	t.Helper()
++
++	id, err := uuid.NewV7()
++	if err != nil {
++		t.Fatalf("unable to create register token id: %v", err)
++	}
++
++	now := time.Now()
++
++	rt := new(apitypes.WorkerRegisterToken)
++	rt.SetTokenID(id.String())
++	rt.SetHostname(host)
++	rt.SetStatus(constants.WorkerRegisterTokenStatusActive)
++	rt.SetCreatedAt(now.Unix())
++	rt.SetExpiresAt(now.Add(tm.WorkerRegisterTokenDuration).Unix())
++
++	_, err = db.CreateWorkerRegisterToken(context.Background(), rt)
++	if err != nil {
++		t.Fatalf("unable to create register token: %v", err)
++	}
++
++	jwt, err := tm.MintToken(&token.MintTokenOpts{
++		Hostname:      host,
++		TokenType:     constants.WorkerRegisterTokenType,
++		TokenDuration: tm.WorkerRegisterTokenDuration,
++		Generation:    id.String(),
++	})
++	if err != nil {
++		t.Fatalf("unable to mint register token: %v", err)
++	}
++
++	return id.String(), jwt
++}
++
++func generationRequest(t *testing.T, r *gin.Engine, method, path, bearer string, body any) *httptest.ResponseRecorder {
++	t.Helper()
++
++	var reader io.Reader
++
++	if body != nil {
++		raw, err := json.Marshal(body)
++		if err != nil {
++			t.Fatalf("unable to marshal body: %v", err)
++		}
++
++		reader = bytes.NewReader(raw)
++	}
++
++	req, err := http.NewRequestWithContext(context.Background(), method, path, reader)
++	if err != nil {
++		t.Fatalf("unable to create request: %v", err)
++	}
++
++	req.Header.Set("Content-Type", "application/json")
++
++	if len(bearer) > 0 {
++		req.Header.Set("Authorization", "Bearer "+bearer)
++	}
++
++	w := httptest.NewRecorder()
++	r.ServeHTTP(w, req)
++
++	return w
++}
++
++func authTokenFromResponse(t *testing.T, w *httptest.ResponseRecorder) string {
++	t.Helper()
++
++	tkn := new(apitypes.Token)
++
++	err := json.Unmarshal(w.Body.Bytes(), tkn)
++	if err != nil {
++		t.Fatalf("unable to decode token response %d %s: %v", w.Code, w.Body.String(), err)
++	}
++
++	return tkn.GetToken()
++}
++
++// TestWorker_GenerationFlow is an end-to-end check that a registration
++// establishes one generation, its register and auth tokens cannot be
++// replayed after a delete and recreate, and concurrent stale writes are
++// rejected without affecting the new worker.
++func TestWorker_GenerationFlow(t *testing.T) {
++	// setup database and router
++	db, err := database.NewTest()
++	if err != nil {
++		t.Fatalf("unable to create test database engine: %v", err)
++	}
++	defer db.Close()
++
++	tm := testTokenManager()
++	r := generationRouter(db, tm, "")
++
++	host := "e2e-worker-gen"
++
++	defer func() {
++		if w, _ := db.GetWorkerForHostname(context.Background(), host); w != nil {
++			_ = db.DeleteWorker(context.Background(), w)
++		}
++	}()
++
++	// 1. register with a fresh register token
++	generationOne, registerOne := issueRegisterToken(t, db, tm, host)
++
++	body := map[string]any{
++		"hostname": host,
++		"address":  "tcp://10.0.0.1:8080",
++		"routes":   []string{"vela"},
++		"active":   true,
++	}
++
++	w := generationRequest(t, r, http.MethodPost, "/workers", registerOne, body)
++	if w.Code != http.StatusCreated {
++		t.Fatalf("registration returned %d: %s", w.Code, w.Body.String())
++	}
++
++	authOne := authTokenFromResponse(t, w)
++
++	cl, err := tm.ParseToken(authOne)
++	if err != nil {
++		t.Fatalf("unable to parse returned auth token: %v", err)
++	}
++
++	if cl.TokenType != constants.WorkerAuthTokenType ||
++		cl.Subject != host ||
++		cl.Generation != generationOne {
++		t.Fatalf("auth token claims are %+v, want WorkerAuth for %s generation %s", cl, host, generationOne)
++	}
++
++	// the worker record is bound to the generation
++	stored, err := db.GetWorkerForHostname(context.Background(), host)
++	if err != nil {
++		t.Fatalf("unable to get stored worker: %v", err)
++	}
++
++	if stored.GetGeneration() != generationOne {
++		t.Fatalf("stored worker generation is %q, want %q", stored.GetGeneration(), generationOne)
++	}
++
++	// 2. the register token cannot establish the generation twice
++	w = generationRequest(t, r, http.MethodPost, "/workers", registerOne, body)
++	if w.Code != http.StatusUnauthorized {
++		t.Errorf("register token replay returned %d, want %d", w.Code, http.StatusUnauthorized)
++	}
++
++	// 3. a register token can never update or refresh a worker
++	w = generationRequest(t, r, http.MethodPut, "/workers/"+host, registerOne, map[string]any{"address": "tcp://evil"})
++	if w.Code != http.StatusUnauthorized {
++		t.Errorf("register token PUT returned %d, want %d", w.Code, http.StatusUnauthorized)
++	}
++
++	w = generationRequest(t, r, http.MethodPost, "/workers/"+host+"/refresh", registerOne, nil)
++	if w.Code != http.StatusUnauthorized {
++		t.Errorf("register token refresh returned %d, want %d", w.Code, http.StatusUnauthorized)
++	}
++
++	// 4. a register token whose generation was never recorded is rejected
++	unknownID, err := uuid.NewV7()
++	if err != nil {
++		t.Fatalf("unable to create unknown generation id: %v", err)
++	}
++
++	registerUnknown, err := tm.MintToken(&token.MintTokenOpts{
++		Hostname:      host,
++		TokenType:     constants.WorkerRegisterTokenType,
++		TokenDuration: tm.WorkerRegisterTokenDuration,
++		Generation:    unknownID.String(),
++	})
++	if err != nil {
++		t.Fatalf("unable to mint unknown register token: %v", err)
++	}
++
++	w = generationRequest(t, r, http.MethodPost, "/workers", registerUnknown, body)
++	if w.Code != http.StatusUnauthorized {
++		t.Errorf("unknown register token returned %d, want %d", w.Code, http.StatusUnauthorized)
++	}
++
++	// 5. normal update and refresh with the current auth token work
++	w = generationRequest(t, r, http.MethodPut, "/workers/"+host, authOne, map[string]any{"address": "tcp://10.0.0.2:8080"})
++	if w.Code != http.StatusOK {
++		t.Fatalf("auth token PUT returned %d: %s", w.Code, w.Body.String())
++	}
++
++	stored, _ = db.GetWorkerForHostname(context.Background(), host)
++	if stored.GetAddress() != "tcp://10.0.0.2:8080" {
++		t.Errorf("address after PUT is %s", stored.GetAddress())
++	}
++
++	w = generationRequest(t, r, http.MethodPost, "/workers/"+host+"/refresh", authOne, nil)
++	if w.Code != http.StatusOK {
++		t.Fatalf("auth token refresh returned %d: %s", w.Code, w.Body.String())
++	}
++
++	refreshed := authTokenFromResponse(t, w)
++
++	refreshedClaims, err := tm.ParseToken(refreshed)
++	if err != nil {
++		t.Fatalf("unable to parse refreshed auth token: %v", err)
++	}
++
++	if refreshedClaims.Generation != generationOne {
++		t.Errorf("refreshed token generation is %q, want %q", refreshedClaims.Generation, generationOne)
++	}
++
++	// 6. a legacy generation-less auth token updates unbound workers but
++	// must be rejected by the generation-bound worker
++	legacyHost := "e2e-worker-legacy"
++
++	legacy := new(apitypes.Worker)
++	legacy.SetHostname(legacyHost)
++	legacy.SetAddress("tcp://10.0.0.3:8080")
++
++	_, err = db.CreateWorker(context.Background(), legacy)
++	if err != nil {
++		t.Fatalf("unable to create legacy worker: %v", err)
++	}
++
++	legacyAuth, err := tm.MintToken(&token.MintTokenOpts{
++		Hostname:      legacyHost,
++		TokenType:     constants.WorkerAuthTokenType,
++		TokenDuration: tm.WorkerAuthTokenDuration,
++	})
++	if err != nil {
++		t.Fatalf("unable to mint legacy auth token: %v", err)
++	}
++
++	w = generationRequest(t, r, http.MethodPut, "/workers/"+legacyHost, legacyAuth, map[string]any{"address": "tcp://10.0.0.4:8080"})
++	if w.Code != http.StatusOK {
++		t.Errorf("legacy auth token PUT returned %d: %s", w.Code, w.Body.String())
++	}
++
++	w = generationRequest(t, r, http.MethodPut, "/workers/"+host, legacyAuth, map[string]any{"address": "tcp://evil"})
++	if w.Code != http.StatusUnauthorized {
++		t.Errorf("generation-less token against bound worker returned %d, want %d", w.Code, http.StatusUnauthorized)
++	}
++
++	stored, _ = db.GetWorkerForHostname(context.Background(), host)
++	if stored.GetAddress() != "tcp://10.0.0.2:8080" {
++		t.Errorf("bound worker address changed after rejected legacy update: %s", stored.GetAddress())
++	}
++
++	// 7. platform admin deletes the worker
++	admin := new(apitypes.User)
++	admin.SetName("e2e-generation-admin")
++	admin.SetToken("admin-token")
++	admin.SetAdmin(true)
++
++	_, err = db.CreateUser(context.Background(), admin)
++	if err != nil {
++		t.Fatalf("unable to create admin user: %v", err)
++	}
++
++	adminToken, err := tm.MintToken(&token.MintTokenOpts{
++		User:          admin,
++		TokenType:     constants.UserAccessTokenType,
++		TokenDuration: time.Hour,
++	})
++	if err != nil {
++		t.Fatalf("unable to mint admin token: %v", err)
++	}
++
++	w = generationRequest(t, r, http.MethodDelete, "/workers/"+host, adminToken, nil)
++	if w.Code != http.StatusOK {
++		t.Fatalf("DELETE worker returned %d: %s", w.Code, w.Body.String())
++	}
++
++	// register tokens and worker row are gone
++	if _, err := db.GetWorkerRegisterToken(context.Background(), generationOne); err == nil {
++		t.Errorf("register token %s should be revoked after delete", generationOne)
++	}
++
++	if _, err := db.GetWorkerForHostname(context.Background(), host); err == nil {
++		t.Errorf("worker %s should not exist after delete", host)
++	}
++
++	// old credentials cannot act once the worker is gone
++	w = generationRequest(t, r, http.MethodPut, "/workers/"+host, authOne, map[string]any{"address": "tcp://evil"})
++	if w.Code != http.StatusNotFound {
++		t.Errorf("old auth PUT after delete returned %d, want %d", w.Code, http.StatusNotFound)
++	}
++
++	w = generationRequest(t, r, http.MethodPost, "/workers/"+host+"/refresh", authOne, nil)
++	if w.Code != http.StatusNotFound {
++		t.Errorf("old auth refresh after delete returned %d, want %d", w.Code, http.StatusNotFound)
++	}
++
++	// old register token cannot recreate the worker
++	w = generationRequest(t, r, http.MethodPost, "/workers", registerOne, body)
++	if w.Code != http.StatusUnauthorized {
++		t.Errorf("old register token after delete returned %d, want %d", w.Code, http.StatusUnauthorized)
++	}
++
++	// 8. a new registration establishes a replacement generation
++	generationTwo, registerTwo := issueRegisterToken(t, db, tm, host)
++
++	replacement := map[string]any{
++		"hostname": host,
++		"address":  "tcp://10.0.1.1:8080",
++		"routes":   []string{"vela", "docker"},
++		"active":   true,
++	}
++
++	w = generationRequest(t, r, http.MethodPost, "/workers", registerTwo, replacement)
++	if w.Code != http.StatusCreated {
++		t.Fatalf("replacement registration returned %d: %s", w.Code, w.Body.String())
++	}
++
++	authTwo := authTokenFromResponse(t, w)
++
++	authTwoClaims, err := tm.ParseToken(authTwo)
++	if err != nil {
++		t.Fatalf("unable to parse replacement auth token: %v", err)
++	}
++
++	if authTwoClaims.Generation != generationTwo {
++		t.Errorf("replacement auth generation is %q, want %q", authTwoClaims.Generation, generationTwo)
++	}
++
++	if generationTwo == generationOne {
++		t.Errorf("replacement generation must differ from the deleted one")
++	}
++
++	// 9. every old-generation credential is rejected against the new record
++	for _, attempt := range []struct {
++		name   string
++		method string
++		path   string
++		token  string
++	}{
++		{"old auth PUT", http.MethodPut, "/workers/" + host, authOne},
++		{"old auth refresh", http.MethodPost, "/workers/" + host + "/refresh", authOne},
++		{"old register PUT", http.MethodPut, "/workers/" + host, registerOne},
++		{"legacy auth PUT", http.MethodPut, "/workers/" + host, legacyAuth},
++	} {
++		w = generationRequest(t, r, attempt.method, attempt.path, attempt.token, map[string]any{"address": "tcp://evil"})
++		if w.Code != http.StatusUnauthorized {
++			t.Errorf("%s returned %d, want %d", attempt.name, w.Code, http.StatusUnauthorized)
++		}
++	}
++
++	// the new worker's data must be untouched by all rejected writes
++	stored, _ = db.GetWorkerForHostname(context.Background(), host)
++	if stored.GetAddress() != "tcp://10.0.1.1:8080" {
++		t.Errorf("replacement worker address is %s, want tcp://10.0.1.1:8080", stored.GetAddress())
++	}
++
++	if len(stored.GetRoutes()) != 2 || stored.GetRoutes()[0] != "vela" {
++		t.Errorf("replacement worker routes are %v, want [vela docker]", stored.GetRoutes())
++	}
++
++	if stored.GetGeneration() != generationTwo {
++		t.Errorf("replacement worker generation is %q, want %q", stored.GetGeneration(), generationTwo)
++	}
++
++	// 10. current-generation update and refresh keep working normally
++	w = generationRequest(t, r, http.MethodPut, "/workers/"+host, authTwo, map[string]any{
++		"address": "tcp://10.0.1.2:8080",
++		"status":  constants.WorkerStatusIdle,
++	})
++	if w.Code != http.StatusOK {
++		t.Errorf("current generation PUT returned %d: %s", w.Code, w.Body.String())
++	}
++
++	w = generationRequest(t, r, http.MethodPost, "/workers/"+host+"/refresh", authTwo, nil)
++	if w.Code != http.StatusOK {
++		t.Errorf("current generation refresh returned %d: %s", w.Code, w.Body.String())
++	}
++}
++
++// TestWorker_GenerationRecovery ensures a registration whose
++// server-side record is missing (for example, one that could not be
++// completed) does not hold the hostname, and the worker can retry.
++func TestWorker_GenerationRecovery(t *testing.T) {
++	// setup database and router
++	db, err := database.NewTest()
++	if err != nil {
++		t.Fatalf("unable to create test database engine: %v", err)
++	}
++	defer db.Close()
++
++	tm := testTokenManager()
++	r := generationRouter(db, tm, "")
++
++	host := "e2e-worker-recover"
++
++	generationOne, registerOne := issueRegisterToken(t, db, tm, host)
++
++	// simulate the registration record being removed before completion
++	err = db.DeleteWorkerRegisterToken(context.Background(), generationOne)
++	if err != nil {
++		t.Fatalf("unable to delete register token: %v", err)
++	}
++
++	body := map[string]any{
++		"hostname": host,
++		"address":  "tcp://10.0.2.1:8080",
++		"routes":   []string{"vela"},
++		"active":   true,
++	}
++
++	// first attempt cannot establish a generation and must not leave a
++	// worker behind occupying the hostname
++	w := generationRequest(t, r, http.MethodPost, "/workers", registerOne, body)
++	if w.Code != http.StatusUnauthorized {
++		t.Fatalf("registration without a valid record returned %d, want %d", w.Code, http.StatusUnauthorized)
++	}
++
++	if _, err := db.GetWorkerForHostname(context.Background(), host); err == nil {
++		t.Fatalf("hostname %s should be free after failed registration", host)
++	}
++
++	// a fresh registration retries successfully
++	_, registerTwo := issueRegisterToken(t, db, tm, host)
++
++	w = generationRequest(t, r, http.MethodPost, "/workers", registerTwo, body)
++	if w.Code != http.StatusCreated {
++		t.Fatalf("retried registration returned %d: %s", w.Code, w.Body.String())
++	}
++
++	stored, err := db.GetWorkerForHostname(context.Background(), host)
++	if err != nil {
++		t.Fatalf("worker should exist after successful retry: %v", err)
++	}
++
++	if len(stored.GetGeneration()) == 0 {
++		t.Errorf("retried worker should be bound to a generation")
++	}
++}
++
++// TestWorker_SymmetricTokenMode verifies the explicitly configured
++// shared symmetric server-worker token keeps registering, updating and
++// refreshing workers without generation binding.
++func TestWorker_SymmetricTokenMode(t *testing.T) {
++	// setup database and router
++	db, err := database.NewTest()
++	if err != nil {
++		t.Fatalf("unable to create test database engine: %v", err)
++	}
++	defer db.Close()
++
++	tm := testTokenManager()
++	secret := "super-secret-symmetric-token"
++	r := generationRouter(db, tm, secret)
++
++	host := "e2e-worker-symmetric"
++
++	body := map[string]any{
++		"hostname": host,
++		"address":  "tcp://10.0.3.1:8080",
++		"routes":   []string{"vela"},
++		"active":   true,
++	}
++
++	// registration with the symmetric token returns that same token and
++	// does not bind a generation
++	w := generationRequest(t, r, http.MethodPost, "/workers", secret, body)
++	if w.Code != http.StatusCreated {
++		t.Fatalf("symmetric registration returned %d: %s", w.Code, w.Body.String())
++	}
++
++	if authTokenFromResponse(t, w) != secret {
++		t.Errorf("symmetric registration should return the shared secret")
++	}
++
++	stored, err := db.GetWorkerForHostname(context.Background(), host)
++	if err != nil {
++		t.Fatalf("unable to get symmetric worker: %v", err)
++	}
++
++	if stored.GetGeneration() != "" {
++		t.Errorf("symmetric worker generation is %q, want empty", stored.GetGeneration())
++	}
++
++	// updates and refresh with the shared token continue to work
++	w = generationRequest(t, r, http.MethodPut, "/workers/"+host, secret, map[string]any{"address": "tcp://10.0.3.2:8080"})
++	if w.Code != http.StatusOK {
++		t.Errorf("symmetric PUT returned %d: %s", w.Code, w.Body.String())
++	}
++
++	w = generationRequest(t, r, http.MethodPost, "/workers/"+host+"/refresh", secret, nil)
++	if w.Code != http.StatusOK {
++		t.Errorf("symmetric refresh returned %d: %s", w.Code, w.Body.String())
++	}
++
++	if authTokenFromResponse(t, w) != secret {
++		t.Errorf("symmetric refresh should return the shared secret")
++	}
++}
+diff --git a/api/worker/refresh.go b/api/worker/refresh.go
+index 7a1c8676..c60da9c7 100644
+--- a/api/worker/refresh.go
++++ b/api/worker/refresh.go
+@@ -3,6 +3,7 @@
+ package worker
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"net/http"
+ 	"strings"
+@@ -14,6 +15,7 @@ import (
+ 	"github.com/go-vela/server/api/types"
+ 	"github.com/go-vela/server/constants"
+ 	"github.com/go-vela/server/database"
++	dbworker "github.com/go-vela/server/database/worker"
+ 	"github.com/go-vela/server/internal/token"
+ 	"github.com/go-vela/server/router/middleware/claims"
+ 	"github.com/go-vela/server/router/middleware/worker"
+@@ -52,6 +54,10 @@ import (
+ //     description: Not found
+ //     schema:
+ //       "$ref": "#/definitions/Error"
++//   '409':
++//     description: Worker generation superseded
++//     schema:
++//       "$ref": "#/definitions/Error"
+ //   '500':
+ //     description: Unexpected server error
+ //     schema:
+@@ -66,6 +72,17 @@ func Refresh(c *gin.Context) {
+ 	cl := claims.Retrieve(c)
+ 	ctx := c.Request.Context()
+ 
++	// register tokens may only establish a generation; they can never be
++	// used to refresh auth for an established generation
++	if cl.TokenType != constants.WorkerAuthTokenType &&
++		!strings.EqualFold(cl.TokenType, constants.ServerWorkerTokenType) {
++		retErr := fmt.Errorf("unable to refresh worker auth: invalid token type, a worker auth token is required")
++
++		util.HandleError(c, http.StatusUnauthorized, retErr)
++
++		return
++	}
++
+ 	// if we are not using a symmetric token, and the subject does not match the input, request should be denied
+ 	if !strings.EqualFold(cl.TokenType, constants.ServerWorkerTokenType) && !strings.EqualFold(cl.Subject, w.GetHostname()) {
+ 		retErr := fmt.Errorf("unable to refresh worker auth: claims subject %s does not match worker hostname %s", cl.Subject, w.GetHostname())
+@@ -77,12 +94,41 @@ func Refresh(c *gin.Context) {
+ 		return
+ 	}
+ 
++	// the auth token may only refresh the generation it was minted for;
++	// a token from a deleted generation can never refresh a newer
++	// same-hostname worker. symmetric tokens and platform admins bypass
++	// generation enforcement.
++	if !cl.IsAdmin &&
++		!strings.EqualFold(cl.TokenType, constants.ServerWorkerTokenType) &&
++		cl.Generation != w.GetGeneration() {
++		l.WithFields(logrus.Fields{
++			"claims_generation": cl.Generation,
++			"worker_generation": w.GetGeneration(),
++		}).Warnf("rejected refresh for worker %s from a different generation", w.GetHostname())
++
++		retErr := fmt.Errorf("unable to refresh worker auth: token is not valid for the current generation of worker %s", w.GetHostname())
++
++		util.HandleError(c, http.StatusUnauthorized, retErr)
++
++		return
++	}
++
+ 	// set last checked in time
+ 	w.SetLastCheckedIn(time.Now().Unix())
+ 
+-	// send API call to update the worker
++	// send API call to update the worker; the write is conditional on the
++	// generation still matching, so a late check-in cannot overwrite a
++	// recreated worker
+ 	_, err := database.FromContext(c).UpdateWorker(ctx, w)
+ 	if err != nil {
++		if errors.Is(err, dbworker.ErrStaleWorker) {
++			retErr := fmt.Errorf("unable to update worker %s: %w", w.GetHostname(), err)
++
++			util.HandleError(c, http.StatusConflict, retErr)
++
++			return
++		}
++
+ 		retErr := fmt.Errorf("unable to update worker %s: %w", w.GetHostname(), err)
+ 
+ 		util.HandleError(c, http.StatusInternalServerError, retErr)
+@@ -110,14 +156,16 @@ func Refresh(c *gin.Context) {
+ 		util.HandleError(c, http.StatusBadRequest, retErr)
+ 
+ 		return
+-	// if worker auth / register token, send back auth token
+-	case constants.WorkerAuthTokenType, constants.WorkerRegisterTokenType:
++	// if worker auth token, send back a new auth token scoped to the
++	// same generation
++	case constants.WorkerAuthTokenType:
+ 		tm := c.MustGet("token-manager").(*token.Manager)
+ 
+ 		wmto := &token.MintTokenOpts{
+ 			TokenType:     constants.WorkerAuthTokenType,
+ 			TokenDuration: tm.WorkerAuthTokenDuration,
+ 			Hostname:      cl.Subject,
++			Generation:    w.GetGeneration(),
+ 		}
+ 
+ 		tkn := new(types.Token)
+diff --git a/api/worker/update.go b/api/worker/update.go
+index 19992834..2574b956 100644
+--- a/api/worker/update.go
++++ b/api/worker/update.go
+@@ -3,6 +3,7 @@
+ package worker
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"net/http"
+ 
+@@ -10,7 +11,10 @@ import (
+ 	"github.com/sirupsen/logrus"
+ 
+ 	"github.com/go-vela/server/api/types"
++	"github.com/go-vela/server/constants"
+ 	"github.com/go-vela/server/database"
++	dbworker "github.com/go-vela/server/database/worker"
++	"github.com/go-vela/server/router/middleware/claims"
+ 	"github.com/go-vela/server/router/middleware/worker"
+ 	"github.com/go-vela/server/util"
+ )
+@@ -63,9 +67,30 @@ import (
+ func UpdateWorker(c *gin.Context) {
+ 	// capture middleware values
+ 	l := c.MustGet("logger").(*logrus.Entry)
++	cl := claims.Retrieve(c)
+ 	w := worker.Retrieve(c)
+ 	ctx := c.Request.Context()
+ 
++	// an auth token may only update the worker generation it was minted
++	// for. this stops auth tokens from a deleted generation from
++	// updating a newer same-hostname worker. platform admin users and the
++	// explicitly configured shared symmetric server-worker token bypass
++	// generation enforcement.
++	if !cl.IsAdmin &&
++		cl.TokenType != constants.ServerWorkerTokenType &&
++		cl.Generation != w.GetGeneration() {
++		l.WithFields(logrus.Fields{
++			"claims_generation": cl.Generation,
++			"worker_generation": w.GetGeneration(),
++		}).Warnf("rejected update for worker %s from a different generation", w.GetHostname())
++
++		retErr := fmt.Errorf("unable to update worker %s: auth token is not valid for the current worker generation", w.GetHostname())
++
++		util.HandleError(c, http.StatusUnauthorized, retErr)
++
++		return
++	}
++
+ 	l.Debugf("updating worker %s", w.GetHostname())
+ 
+ 	// capture body from API request
+@@ -123,6 +148,17 @@ func UpdateWorker(c *gin.Context) {
+ 	// send API call to update the worker
+ 	w, err = database.FromContext(c).UpdateWorker(ctx, w)
+ 	if err != nil {
++		// the worker was deleted and recreated as a newer generation
++		// between loading the record and writing it; the stale write was
++		// conditionally rejected
++		if errors.Is(err, dbworker.ErrStaleWorker) {
++			retErr := fmt.Errorf("unable to update worker %s: %w", w.GetHostname(), err)
++
++			util.HandleError(c, http.StatusConflict, retErr)
++
++			return
++		}
++
+ 		retErr := fmt.Errorf("unable to update worker %s: %w", w.GetHostname(), err)
+ 
+ 		util.HandleError(c, http.StatusInternalServerError, retErr)
+diff --git a/constants/table.go b/constants/table.go
+index fe0b73d8..b6d88457 100644
+--- a/constants/table.go
++++ b/constants/table.go
+@@ -54,4 +54,9 @@ const (
+ 
+ 	// TableWorker defines the table type for the database workers table.
+ 	TableWorker = "workers"
++
++	// TableWorkerRegisterToken defines the table type for the database
++	// worker register tokens table. Each row authorizes exactly one
++	// worker registration (one worker lifecycle generation).
++	TableWorkerRegisterToken = "worker_register_tokens"
+ )
+diff --git a/constants/worker_register.go b/constants/worker_register.go
+new file mode 100644
+index 00000000..79e0ea9f
+--- /dev/null
++++ b/constants/worker_register.go
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: Apache-2.0
++
++package constants
++
++// Worker register token statuses.
++//
++// A register token authorizes exactly one worker registration. The
++// registration establishes a single worker lifecycle generation: the
++// register token's generation identifier is recorded on the worker row
++// and is embedded in every auth token minted for that generation.
++const (
++	// WorkerRegisterTokenStatusActive defines the status for a register
++	// token that has been issued but not yet consumed by a registration.
++	WorkerRegisterTokenStatusActive = "active"
++
++	// WorkerRegisterTokenStatusUsed defines the status for a register
++	// token that has already established a worker generation. It can
++	// never establish another generation.
++	WorkerRegisterTokenStatusUsed = "used"
++)
+diff --git a/database/integration_test.go b/database/integration_test.go
+index f95faa10..332ff1f7 100644
+--- a/database/integration_test.go
++++ b/database/integration_test.go
+@@ -2742,7 +2742,35 @@ func testWorkers(t *testing.T, db Interface, resources *Resources) {
+ 	methods["UpdateWorker"] = true
+ 	methods["GetWorker"] = true
+ 
+-	// delete the workers
++	// exercise the single-use register token lifecycle used to establish
++	// worker lifecycle generations
++	_registerToken := new(api.WorkerRegisterToken)
++	_registerToken.SetTokenID("01923b64-0000-7000-9000-000000000001")
++	_registerToken.SetHostname(resources.Workers[0].GetHostname())
++	_registerToken.SetStatus(constants.WorkerRegisterTokenStatusActive)
++	_registerToken.SetCreatedAt(time.Now().Unix())
++	_registerToken.SetExpiresAt(time.Now().Add(time.Hour).Unix())
++
++	_registerToken, err = db.CreateWorkerRegisterToken(context.TODO(), _registerToken)
++	if err != nil {
++		t.Errorf("unable to create worker register token: %v", err)
++	}
++
++	methods["CreateWorkerRegisterToken"] = true
++
++	_gotToken, err := db.GetWorkerRegisterToken(context.TODO(), _registerToken.GetTokenID())
++	if err != nil {
++		t.Errorf("unable to get worker register token: %v", err)
++	}
++
++	if !cmp.Equal(_gotToken, _registerToken) {
++		t.Errorf("GetWorkerRegisterToken() is %v, want %v", _gotToken, _registerToken)
++	}
++
++	methods["GetWorkerRegisterToken"] = true
++
++	// delete the workers, which must also revoke the register token
++	// issued for the first worker's hostname
+ 	for _, worker := range resources.Workers {
+ 		err = db.DeleteWorker(context.TODO(), worker)
+ 		if err != nil {
+@@ -2752,6 +2780,33 @@ func testWorkers(t *testing.T, db Interface, resources *Resources) {
+ 
+ 	methods["DeleteWorker"] = true
+ 
++	// deleting a worker must have removed register tokens for its hostname
++	_, err = db.GetWorkerRegisterToken(context.TODO(), _registerToken.GetTokenID())
++	if err == nil {
++		t.Errorf("GetWorkerRegisterToken() should not find token %s after worker delete", _registerToken.GetTokenID())
++	}
++
++	// exercise explicit register token deletion as well (rollback of a
++	// registration that could not complete)
++	_registerTokenTwo := new(api.WorkerRegisterToken)
++	_registerTokenTwo.SetTokenID("01923b64-0000-7000-9000-000000000002")
++	_registerTokenTwo.SetHostname("worker-unregistered.example.com")
++	_registerTokenTwo.SetStatus(constants.WorkerRegisterTokenStatusActive)
++	_registerTokenTwo.SetCreatedAt(time.Now().Unix())
++	_registerTokenTwo.SetExpiresAt(time.Now().Add(time.Hour).Unix())
++
++	_, err = db.CreateWorkerRegisterToken(context.TODO(), _registerTokenTwo)
++	if err != nil {
++		t.Errorf("unable to create second worker register token: %v", err)
++	}
++
++	err = db.DeleteWorkerRegisterToken(context.TODO(), _registerTokenTwo.GetTokenID())
++	if err != nil {
++		t.Errorf("unable to delete worker register token: %v", err)
++	}
++
++	methods["DeleteWorkerRegisterToken"] = true
++
+ 	// ensure we called all the methods we expected to
+ 	for method, called := range methods {
+ 		if !called {
+diff --git a/database/resource_test.go b/database/resource_test.go
+index 5f68b484..a4c3da33 100644
+--- a/database/resource_test.go
++++ b/database/resource_test.go
+@@ -80,6 +80,9 @@ func TestDatabase_Engine_NewResources(t *testing.T) {
+ 	// ensure the mock expects the worker queries
+ 	_mock.ExpectExec(worker.CreatePostgresTable).WillReturnResult(sqlmock.NewResult(1, 1))
+ 	_mock.ExpectExec(worker.CreateHostnameAddressIndex).WillReturnResult(sqlmock.NewResult(1, 1))
++	_mock.ExpectExec(worker.AlterPostgresWorkerGeneration).WillReturnResult(sqlmock.NewResult(1, 1))
++	_mock.ExpectExec(worker.CreatePostgresRegisterTokenTable).WillReturnResult(sqlmock.NewResult(1, 1))
++	_mock.ExpectExec(worker.CreateRegisterTokenHostnameIndex).WillReturnResult(sqlmock.NewResult(1, 1))
+ 
+ 	// create a test database without mocking the call
+ 	_unmocked, _ := testPostgres(t)
+diff --git a/database/types/worker.go b/database/types/worker.go
+index 5afa6b34..0c374331 100644
+--- a/database/types/worker.go
++++ b/database/types/worker.go
+@@ -42,6 +42,7 @@ type Worker struct {
+ 	LastBuildFinishedAt sql.NullInt64  `sql:"last_build_finished_at"`
+ 	LastCheckedIn       sql.NullInt64  `sql:"last_checked_in"`
+ 	BuildLimit          sql.NullInt32  `sql:"build_limit"`
++	Generation          sql.NullString `sql:"generation"`
+ }
+ 
+ // Nullify ensures the valid flag for
+@@ -99,6 +100,11 @@ func (w *Worker) Nullify() *Worker {
+ 		w.BuildLimit.Valid = false
+ 	}
+ 
++	// check if the Generation field should be false
++	if len(w.Generation.String) == 0 {
++		w.Generation.Valid = false
++	}
++
+ 	return w
+ }
+ 
+@@ -120,6 +126,12 @@ func (w *Worker) ToAPI(builds []*api.Build) *api.Worker {
+ 	worker.SetLastCheckedIn(w.LastCheckedIn.Int64)
+ 	worker.SetBuildLimit(w.BuildLimit.Int32)
+ 
++	// only set the generation when the record carries one;
++	// legacy rows (and the shared symmetric token mode) have none
++	if w.Generation.Valid {
++		worker.SetGeneration(w.Generation.String)
++	}
++
+ 	return worker
+ }
+ 
+@@ -186,6 +198,7 @@ func WorkerFromAPI(w *api.Worker) *Worker {
+ 		LastBuildFinishedAt: sql.NullInt64{Int64: w.GetLastBuildFinishedAt(), Valid: true},
+ 		LastCheckedIn:       sql.NullInt64{Int64: w.GetLastCheckedIn(), Valid: true},
+ 		BuildLimit:          sql.NullInt32{Int32: w.GetBuildLimit(), Valid: true},
++		Generation:          sql.NullString{String: w.GetGeneration(), Valid: true},
+ 	}
+ 
+ 	return worker.Nullify()
+diff --git a/database/types/worker_register_token.go b/database/types/worker_register_token.go
+new file mode 100644
+index 00000000..e06396fc
+--- /dev/null
++++ b/database/types/worker_register_token.go
+@@ -0,0 +1,146 @@
++// SPDX-License-Identifier: Apache-2.0
++
++package types
++
++import (
++	"database/sql"
++	"errors"
++
++	api "github.com/go-vela/server/api/types"
++	"github.com/go-vela/server/util"
++)
++
++var (
++	// ErrEmptyWorkerRegisterTokenID defines the error type when a
++	// WorkerRegisterToken type has an empty TokenID field provided.
++	ErrEmptyWorkerRegisterTokenID = errors.New("empty worker register token id provided")
++
++	// ErrEmptyWorkerRegisterTokenHost defines the error type when a
++	// WorkerRegisterToken type has an empty Hostname field provided.
++	ErrEmptyWorkerRegisterTokenHost = errors.New("empty worker register token hostname provided")
++
++	// ErrEmptyWorkerRegisterTokenStatus defines the error type when a
++	// WorkerRegisterToken type has an empty Status field provided.
++	ErrEmptyWorkerRegisterTokenStatus = errors.New("empty worker register token status provided")
++)
++
++// WorkerRegisterToken is the database representation of a single-use
++// worker registration token. Each row authorizes one registration of
++// one worker lifecycle generation for a hostname.
++type WorkerRegisterToken struct {
++	ID        sql.NullInt64  `sql:"id"`
++	TokenID   sql.NullString `sql:"token_id"`
++	Hostname  sql.NullString `sql:"hostname"`
++	Status    sql.NullString `sql:"status"`
++	WorkerID  sql.NullInt64  `sql:"worker_id"`
++	ExpiresAt sql.NullInt64  `sql:"expires_at"`
++	CreatedAt sql.NullInt64  `sql:"created_at"`
++}
++
++// Nullify ensures the valid flag for
++// the sql.Null types are properly set.
++//
++// When a field within the WorkerRegisterToken type is the zero
++// value for the field, the valid flag is set to false causing it
++// to be NULL in the database.
++func (r *WorkerRegisterToken) Nullify() *WorkerRegisterToken {
++	if r == nil {
++		return nil
++	}
++
++	// check if the ID field should be false
++	if r.ID.Int64 == 0 {
++		r.ID.Valid = false
++	}
++
++	// check if the TokenID field should be false
++	if len(r.TokenID.String) == 0 {
++		r.TokenID.Valid = false
++	}
++
++	// check if the Hostname field should be false
++	if len(r.Hostname.String) == 0 {
++		r.Hostname.Valid = false
++	}
++
++	// check if the Status field should be false
++	if len(r.Status.String) == 0 {
++		r.Status.Valid = false
++	}
++
++	// check if the WorkerID field should be false
++	if r.WorkerID.Int64 == 0 {
++		r.WorkerID.Valid = false
++	}
++
++	// check if the ExpiresAt field should be false
++	if r.ExpiresAt.Int64 == 0 {
++		r.ExpiresAt.Valid = false
++	}
++
++	// check if the CreatedAt field should be false
++	if r.CreatedAt.Int64 == 0 {
++		r.CreatedAt.Valid = false
++	}
++
++	return r
++}
++
++// ToAPI converts the WorkerRegisterToken type
++// to an API WorkerRegisterToken type.
++func (r *WorkerRegisterToken) ToAPI() *api.WorkerRegisterToken {
++	token := new(api.WorkerRegisterToken)
++
++	token.SetID(r.ID.Int64)
++	token.SetTokenID(r.TokenID.String)
++	token.SetHostname(r.Hostname.String)
++	token.SetStatus(r.Status.String)
++	token.SetWorkerID(r.WorkerID.Int64)
++	token.SetExpiresAt(r.ExpiresAt.Int64)
++	token.SetCreatedAt(r.CreatedAt.Int64)
++
++	return token
++}
++
++// Validate verifies the necessary fields for the
++// WorkerRegisterToken type are populated correctly.
++func (r *WorkerRegisterToken) Validate() error {
++	// verify the TokenID field is populated
++	if len(r.TokenID.String) == 0 {
++		return ErrEmptyWorkerRegisterTokenID
++	}
++
++	// verify the Hostname field is populated
++	if len(r.Hostname.String) == 0 {
++		return ErrEmptyWorkerRegisterTokenHost
++	}
++
++	// verify the Status field is populated
++	if len(r.Status.String) == 0 {
++		return ErrEmptyWorkerRegisterTokenStatus
++	}
++
++	// ensure that all string fields that can be returned as JSON
++	// are sanitized to avoid unsafe HTML content
++	r.TokenID = sql.NullString{String: util.Sanitize(r.TokenID.String), Valid: r.TokenID.Valid}
++	r.Hostname = sql.NullString{String: util.Sanitize(r.Hostname.String), Valid: r.Hostname.Valid}
++	r.Status = sql.NullString{String: util.Sanitize(r.Status.String), Valid: r.Status.Valid}
++
++	return nil
++}
++
++// WorkerRegisterTokenFromAPI converts the API worker register token
++// type to a database worker register token type.
++func WorkerRegisterTokenFromAPI(r *api.WorkerRegisterToken) *WorkerRegisterToken {
++	token := &WorkerRegisterToken{
++		ID:        sql.NullInt64{Int64: r.GetID(), Valid: true},
++		TokenID:   sql.NullString{String: r.GetTokenID(), Valid: true},
++		Hostname:  sql.NullString{String: r.GetHostname(), Valid: true},
++		Status:    sql.NullString{String: r.GetStatus(), Valid: true},
++		WorkerID:  sql.NullInt64{Int64: r.GetWorkerID(), Valid: true},
++		ExpiresAt: sql.NullInt64{Int64: r.GetExpiresAt(), Valid: true},
++		CreatedAt: sql.NullInt64{Int64: r.GetCreatedAt(), Valid: true},
++	}
++
++	return token.Nullify()
++}
+diff --git a/database/worker/create.go b/database/worker/create.go
+index 994fe594..26282f1d 100644
+--- a/database/worker/create.go
++++ b/database/worker/create.go
+@@ -4,8 +4,10 @@ package worker
+ 
+ import (
+ 	"context"
++	"time"
+ 
+ 	"github.com/sirupsen/logrus"
++	"gorm.io/gorm"
+ 
+ 	api "github.com/go-vela/server/api/types"
+ 	"github.com/go-vela/server/constants"
+@@ -13,6 +15,15 @@ import (
+ )
+ 
+ // CreateWorker creates a new worker in the database.
++//
++// When the worker carries a generation identifier (registration flow),
++// creation and consumption of the authorizing register token happen in
++// a single transaction. The register token is only considered consumed
++// when it is still active, unexpired, and scoped to the worker
++// hostname; otherwise the worker insert is rolled back and the
++// generation is left unestablished. Workers created with the shared
++// symmetric server-worker token carry no generation and skip the
++// consumption check.
+ func (e *Engine) CreateWorker(ctx context.Context, w *api.Worker) (*api.Worker, error) {
+ 	e.logger.WithFields(logrus.Fields{
+ 		"worker": w.GetHostname(),
+@@ -27,11 +38,56 @@ func (e *Engine) CreateWorker(ctx context.Context, w *api.Worker) (*api.Worker,
+ 		return nil, err
+ 	}
+ 
+-	// send query to the database
+-	result := e.client.
+-		WithContext(ctx).
+-		Table(constants.TableWorker).
+-		Create(worker)
++	// no generation means the shared symmetric token mode:
++	// persist the worker without consuming a register token
++	if len(w.GetGeneration()) == 0 {
++		// send query to the database
++		result := e.client.
++			WithContext(ctx).
++			Table(constants.TableWorker).
++			Create(worker)
+ 
+-	return worker.ToAPI(w.GetRunningBuilds()), result.Error
++		return worker.ToAPI(w.GetRunningBuilds()), result.Error
++	}
++
++	// registration flow: establish the worker generation and mark the
++	// authorizing register token used atomically
++	err = e.client.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
++		// insert the worker row for the new generation
++		if err := tx.
++			Table(constants.TableWorker).
++			Create(worker).Error; err != nil {
++			return err
++		}
++
++		// conditionally consume the register token. This guards against
++		// replayed, already-used, expired, or wrong-hostname tokens, and
++		// is race-safe with concurrent registration attempts.
++		result := tx.
++			Table(constants.TableWorkerRegisterToken).
++			Where("token_id = ?", w.GetGeneration()).
++			Where("hostname = ?", w.GetHostname()).
++			Where("status = ?", constants.WorkerRegisterTokenStatusActive).
++			Where("expires_at > ?", time.Now().Unix()).
++			Updates(map[string]any{
++				"status":    constants.WorkerRegisterTokenStatusUsed,
++				"worker_id": worker.ID.Int64,
++			})
++		if result.Error != nil {
++			return result.Error
++		}
++
++		if result.RowsAffected != 1 {
++			// roll back the worker insert so the hostname is never left
++			// occupied by a generation without valid credentials
++			return ErrInvalidWorkerRegisterToken
++		}
++
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	return worker.ToAPI(w.GetRunningBuilds()), nil
+ }
+diff --git a/database/worker/create_test.go b/database/worker/create_test.go
+index c62b0f25..1c5cfc95 100644
+--- a/database/worker/create_test.go
++++ b/database/worker/create_test.go
+@@ -27,9 +27,9 @@ func TestWorker_Engine_CreateWorker(t *testing.T) {
+ 
+ 	// ensure the mock expects the query
+ 	_mock.ExpectQuery(`INSERT INTO "workers"
+-("hostname","address","routes","active","status","last_status_update_at","running_build_ids","last_build_started_at","last_build_finished_at","last_checked_in","build_limit","id")
+-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING "id"`).
+-		WithArgs("worker_0", "localhost", nil, true, nil, nil, `{"1"}`, nil, nil, nil, nil, 1).
++("hostname","address","routes","active","status","last_status_update_at","running_build_ids","last_build_started_at","last_build_finished_at","last_checked_in","build_limit","generation","id")
++VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING "id"`).
++		WithArgs("worker_0", "localhost", nil, true, nil, nil, `{"1"}`, nil, nil, nil, nil, nil, 1).
+ 		WillReturnRows(_rows)
+ 
+ 	_sqlite := testSqlite(t)
+diff --git a/database/worker/delete.go b/database/worker/delete.go
+index 144cbdbf..6578cb52 100644
+--- a/database/worker/delete.go
++++ b/database/worker/delete.go
+@@ -6,6 +6,7 @@ import (
+ 	"context"
+ 
+ 	"github.com/sirupsen/logrus"
++	"gorm.io/gorm"
+ 
+ 	api "github.com/go-vela/server/api/types"
+ 	"github.com/go-vela/server/constants"
+@@ -13,6 +14,13 @@ import (
+ )
+ 
+ // DeleteWorker deletes an existing worker from the database.
++//
++// The worker row and every register token issued for its hostname are
++// removed in a single transaction. Once the delete commits, register
++// tokens from any prior generation cannot establish a same-named
++// worker and auth tokens from prior generations can no longer match
++// the record, so neither can affect a worker later registered with the
++// same hostname.
+ func (e *Engine) DeleteWorker(ctx context.Context, w *api.Worker) error {
+ 	e.logger.WithFields(logrus.Fields{
+ 		"worker": w.GetHostname(),
+@@ -21,10 +29,27 @@ func (e *Engine) DeleteWorker(ctx context.Context, w *api.Worker) error {
+ 	// cast the API type to database type
+ 	worker := types.WorkerFromAPI(w)
+ 
+-	// send query to the database
+-	return e.client.
+-		WithContext(ctx).
+-		Table(constants.TableWorker).
+-		Delete(worker).
+-		Error
++	return e.client.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
++		// delete the worker row; a missing row means it was already
++		// removed by a concurrent delete
++		result := tx.
++			Table(constants.TableWorker).
++			Delete(worker)
++		if result.Error != nil {
++			return result.Error
++		}
++
++		if result.RowsAffected == 0 {
++			return ErrStaleWorker
++		}
++
++		// revoke every register token (pending or consumed) issued for
++		// this hostname, preventing old generations from being
++		// re-established after the delete
++		return tx.
++			Table(constants.TableWorkerRegisterToken).
++			Where("hostname = ?", w.GetHostname()).
++			Delete(new(types.WorkerRegisterToken)).
++			Error
++	})
+ }
+diff --git a/database/worker/delete_test.go b/database/worker/delete_test.go
+index 9c16f2b2..69810834 100644
+--- a/database/worker/delete_test.go
++++ b/database/worker/delete_test.go
+@@ -21,10 +21,16 @@ func TestWorker_Engine_DeleteWorker(t *testing.T) {
+ 
+ 	defer func() { _sql, _ := _postgres.client.DB(); _sql.Close() }()
+ 
+-	// ensure the mock expects the query
++	// ensure the mock expects the transactional delete: the worker row is
++	// removed and every register token issued for its hostname is revoked
++	_mock.ExpectBegin()
+ 	_mock.ExpectExec(`DELETE FROM "workers" WHERE "workers"."id" = $1`).
+ 		WithArgs(1).
+ 		WillReturnResult(sqlmock.NewResult(1, 1))
++	_mock.ExpectExec(`DELETE FROM "worker_register_tokens" WHERE hostname = $1`).
++		WithArgs("worker_0").
++		WillReturnResult(sqlmock.NewResult(1, 1))
++	_mock.ExpectCommit()
+ 
+ 	_sqlite := testSqlite(t)
+ 
+diff --git a/database/worker/generation_test.go b/database/worker/generation_test.go
+new file mode 100644
+index 00000000..dce7f732
+--- /dev/null
++++ b/database/worker/generation_test.go
+@@ -0,0 +1,236 @@
++// SPDX-License-Identifier: Apache-2.0
++
++package worker
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	api "github.com/go-vela/server/api/types"
++	"github.com/go-vela/server/constants"
++)
++
++// newGenerationWorker builds an unpersisted generation-bound worker.
++func newGenerationWorker(host, address, generation string) *api.Worker {
++	w := new(api.Worker)
++	w.SetHostname(host)
++	w.SetAddress(address)
++	w.SetRoutes([]string{"vela"})
++	w.SetActive(true)
++	w.SetStatus(constants.WorkerStatusAvailable)
++	w.SetGeneration(generation)
++
++	return w
++}
++
++// TestWorker_GenerationLifecycle exercises the security properties of
++// worker lifecycle generations at the database layer using Sqlite.
++func TestWorker_GenerationLifecycle(t *testing.T) {
++	// setup types
++	_engine := testSqlite(t)
++
++	defer func() { _sql, _ := _engine.client.DB(); _sql.Close() }()
++
++	ctx := context.TODO()
++	now := time.Now().Unix()
++
++	// 1. an active register token establishes exactly one generation
++	registerToken := new(api.WorkerRegisterToken)
++	registerToken.SetTokenID("generation-one")
++	registerToken.SetHostname("gen-worker")
++	registerToken.SetStatus(constants.WorkerRegisterTokenStatusActive)
++	registerToken.SetCreatedAt(now)
++	registerToken.SetExpiresAt(now + 3600)
++
++	_, err := _engine.CreateWorkerRegisterToken(ctx, registerToken)
++	if err != nil {
++		t.Fatalf("unable to create register token: %v", err)
++	}
++
++	workerOne := newGenerationWorker("gen-worker", "https://10.0.0.1:8080", "generation-one")
++
++	workerOne, err = _engine.CreateWorker(ctx, workerOne)
++	if err != nil {
++		t.Fatalf("CreateWorker with a valid register token returned err: %v", err)
++	}
++
++	if workerOne.GetGeneration() != "generation-one" {
++		t.Errorf("worker generation is %s, want generation-one", workerOne.GetGeneration())
++	}
++
++	// the register token must now be marked used and bound to the worker
++	consumed, err := _engine.GetWorkerRegisterToken(ctx, "generation-one")
++	if err != nil {
++		t.Fatalf("unable to get consumed register token: %v", err)
++	}
++
++	if consumed.GetStatus() != constants.WorkerRegisterTokenStatusUsed {
++		t.Errorf("register token status is %s, want %s", consumed.GetStatus(), constants.WorkerRegisterTokenStatusUsed)
++	}
++
++	if consumed.GetWorkerID() != workerOne.GetID() {
++		t.Errorf("register token worker id is %d, want %d", consumed.GetWorkerID(), workerOne.GetID())
++	}
++
++	// 2. a token scoped to a different hostname cannot establish a generation
++	wrongHost := newGenerationWorker("gen-worker-other", "https://10.0.0.2:8080", "generation-one")
++
++	_, err = _engine.CreateWorker(ctx, wrongHost)
++	if !errors.Is(err, ErrInvalidWorkerRegisterToken) {
++		t.Errorf("CreateWorker with mismatched hostname returned %v, want ErrInvalidWorkerRegisterToken", err)
++	}
++
++	// 3. an expired register token is rejected and rolls the worker
++	// insert back, leaving the hostname unoccupied
++	expiredToken := new(api.WorkerRegisterToken)
++	expiredToken.SetTokenID("generation-expired")
++	expiredToken.SetHostname("gen-worker-expired")
++	expiredToken.SetStatus(constants.WorkerRegisterTokenStatusActive)
++	expiredToken.SetCreatedAt(now - 7200)
++	expiredToken.SetExpiresAt(now - 1)
++
++	_, err = _engine.CreateWorkerRegisterToken(ctx, expiredToken)
++	if err != nil {
++		t.Fatalf("unable to create expired register token: %v", err)
++	}
++
++	expiredWorker := newGenerationWorker("gen-worker-expired", "https://10.0.0.3:8080", "generation-expired")
++
++	_, err = _engine.CreateWorker(ctx, expiredWorker)
++	if !errors.Is(err, ErrInvalidWorkerRegisterToken) {
++		t.Errorf("CreateWorker with expired token returned %v, want ErrInvalidWorkerRegisterToken", err)
++	}
++
++	_, err = _engine.GetWorkerForHostname(ctx, "gen-worker-expired")
++	if err == nil {
++		t.Errorf("worker gen-worker-expired should not exist after rolled back registration")
++	}
++
++	// 4. an unknown register token is rejected and leaves no worker behind
++	unknownWorker := newGenerationWorker("gen-worker-unknown", "https://10.0.0.4:8080", "generation-unknown")
++
++	_, err = _engine.CreateWorker(ctx, unknownWorker)
++	if !errors.Is(err, ErrInvalidWorkerRegisterToken) {
++		t.Errorf("CreateWorker with unknown token returned %v, want ErrInvalidWorkerRegisterToken", err)
++	}
++
++	_, err = _engine.GetWorkerForHostname(ctx, "gen-worker-unknown")
++	if err == nil {
++		t.Errorf("worker gen-worker-unknown should not exist after rejected registration")
++	}
++
++	// 5. deleting the worker revokes every register token for the hostname;
++	// the old generation can no longer establish or act on the worker
++	err = _engine.DeleteWorker(ctx, workerOne)
++	if err != nil {
++		t.Fatalf("DeleteWorker returned err: %v", err)
++	}
++
++	_, err = _engine.GetWorkerRegisterToken(ctx, "generation-one")
++	if err == nil {
++		t.Errorf("register token generation-one should be revoked after worker delete")
++	}
++
++	_, err = _engine.GetWorkerForHostname(ctx, "gen-worker")
++	if err == nil {
++		t.Errorf("worker gen-worker should be deleted")
++	}
++
++	// recreating with the revoked register token must fail atomically
++	replayWorker := newGenerationWorker("gen-worker", "https://10.0.0.1:8080", "generation-one")
++
++	_, err = _engine.CreateWorker(ctx, replayWorker)
++	if !errors.Is(err, ErrInvalidWorkerRegisterToken) {
++		t.Errorf("CreateWorker with revoked token returned %v, want ErrInvalidWorkerRegisterToken", err)
++	}
++
++	// the failed replay must not occupy the hostname
++	_, err = _engine.GetWorkerForHostname(ctx, "gen-worker")
++	if err == nil {
++		t.Errorf("worker gen-worker should not exist after rejected replay")
++	}
++
++	// 6. a fresh register token establishes the replacement generation
++	newToken := new(api.WorkerRegisterToken)
++	newToken.SetTokenID("generation-two")
++	newToken.SetHostname("gen-worker")
++	newToken.SetStatus(constants.WorkerRegisterTokenStatusActive)
++	newToken.SetCreatedAt(now)
++	newToken.SetExpiresAt(now + 3600)
++
++	_, err = _engine.CreateWorkerRegisterToken(ctx, newToken)
++	if err != nil {
++		t.Fatalf("unable to create replacement register token: %v", err)
++	}
++
++	workerTwo := newGenerationWorker("gen-worker", "https://10.0.0.9:8080", "generation-two")
++
++	workerTwo, err = _engine.CreateWorker(ctx, workerTwo)
++	if err != nil {
++		t.Fatalf("CreateWorker replacement generation returned err: %v", err)
++	}
++
++	if workerTwo.GetID() == workerOne.GetID() {
++		t.Errorf("replacement worker id %d must differ from deleted id %d", workerTwo.GetID(), workerOne.GetID())
++	}
++
++	// 7. a late update carrying the old generation is conditionally
++	// rejected; it must never overwrite the new worker's data
++	stale := newGenerationWorker("gen-worker", "https://evil.override:8080", "generation-one")
++	stale.SetID(workerOne.GetID())
++
++	_, err = _engine.UpdateWorker(ctx, stale)
++	if !errors.Is(err, ErrStaleWorker) {
++		t.Errorf("UpdateWorker from an old generation returned %v, want ErrStaleWorker", err)
++	}
++
++	current, err := _engine.GetWorkerForHostname(ctx, "gen-worker")
++	if err != nil {
++		t.Fatalf("unable to get current worker: %v", err)
++	}
++
++	if current.GetAddress() != "https://10.0.0.9:8080" {
++		t.Errorf("new worker address was overwritten by a stale update: %s", current.GetAddress())
++	}
++
++	if current.GetGeneration() != "generation-two" {
++		t.Errorf("new worker generation is %s, want generation-two", current.GetGeneration())
++	}
++
++	// 8. the current generation updates normally
++	current.SetAddress("https://10.0.0.10:8080")
++
++	current, err = _engine.UpdateWorker(ctx, current)
++	if err != nil {
++		t.Errorf("UpdateWorker for current generation returned err: %v", err)
++	}
++
++	if current.GetAddress() != "https://10.0.0.10:8080" {
++		t.Errorf("updated address is %s, want https://10.0.0.10:8080", current.GetAddress())
++	}
++
++	// 9. a double delete is reported as stale
++	err = _engine.DeleteWorker(ctx, workerOne)
++	if !errors.Is(err, ErrStaleWorker) {
++		t.Errorf("second DeleteWorker returned %v, want ErrStaleWorker", err)
++	}
++
++	// 10. legacy workers (no generation) keep updating on ID only
++	legacy := new(api.Worker)
++	legacy.SetHostname("gen-worker-legacy")
++	legacy.SetAddress("https://10.0.0.5:8080")
++
++	legacy, err = _engine.CreateWorker(ctx, legacy)
++	if err != nil {
++		t.Fatalf("CreateWorker legacy returned err: %v", err)
++	}
++
++	legacy.SetStatus(constants.WorkerStatusIdle)
++
++	_, err = _engine.UpdateWorker(ctx, legacy)
++	if err != nil {
++		t.Errorf("UpdateWorker legacy returned err: %v", err)
++	}
++}
+diff --git a/database/worker/index.go b/database/worker/index.go
+index 31554786..899bf931 100644
+--- a/database/worker/index.go
++++ b/database/worker/index.go
+@@ -12,6 +12,34 @@ CREATE INDEX
+ IF NOT EXISTS
+ workers_hostname_address
+ ON workers (hostname, address);
++`
++
++	// CreateRegisterTokenHostnameIndex represents a query to create an
++	// index on the worker register tokens table for the hostname column,
++	// allowing every token issued for a hostname to be revoked atomically
++	// when the worker is deleted.
++	CreateRegisterTokenHostnameIndex = `
++CREATE INDEX
++IF NOT EXISTS
++worker_register_tokens_hostname
++ON worker_register_tokens (hostname);
++`
++
++	// AlterPostgresWorkerGeneration represents an idempotent query to add
++	// the generation column to a workers table created before generations
++	// existed.
++	AlterPostgresWorkerGeneration = `
++ALTER TABLE workers
++ADD COLUMN IF NOT EXISTS generation VARCHAR(36);
++`
++
++	// AlterSqliteWorkerGeneration represents a query to add the
++	// generation column to a Sqlite workers table created before
++	// generations existed. Sqlite has no "ADD COLUMN IF NOT EXISTS";
++	// a duplicate-column error from this statement is ignored.
++	AlterSqliteWorkerGeneration = `
++ALTER TABLE workers
++ADD COLUMN generation TEXT;
+ `
+ )
+ 
+@@ -24,3 +52,14 @@ func (e *Engine) CreateWorkerIndexes(ctx context.Context) error {
+ 		WithContext(ctx).
+ 		Exec(CreateHostnameAddressIndex).Error
+ }
++
++// CreateWorkerRegisterTokenIndexes creates the indexes for the worker
++// register tokens table in the database.
++func (e *Engine) CreateWorkerRegisterTokenIndexes(ctx context.Context) error {
++	e.logger.Tracef("creating indexes for worker register tokens table")
++
++	// create the hostname index for the worker register tokens table
++	return e.client.
++		WithContext(ctx).
++		Exec(CreateRegisterTokenHostnameIndex).Error
++}
+diff --git a/database/worker/interface.go b/database/worker/interface.go
+index 130f7434..a90c8aa9 100644
+--- a/database/worker/interface.go
++++ b/database/worker/interface.go
+@@ -28,16 +28,29 @@ type WorkerInterface interface {
+ 
+ 	// CountWorkers defines a function that gets the count of all workers.
+ 	CountWorkers(context.Context) (int64, error)
+-	// CreateWorker defines a function that creates a new worker.
++	// CreateWorker defines a function that creates a new worker. When the
++	// worker carries a generation, its register token is consumed
++	// atomically with the insert.
+ 	CreateWorker(context.Context, *api.Worker) (*api.Worker, error)
+-	// DeleteWorker defines a function that deletes an existing worker.
++	// CreateWorkerRegisterToken defines a function that stores a newly
++	// issued, single-use worker registration token.
++	CreateWorkerRegisterToken(context.Context, *api.WorkerRegisterToken) (*api.WorkerRegisterToken, error)
++	// DeleteWorker defines a function that deletes an existing worker and
++	// revokes all register tokens issued for its hostname.
+ 	DeleteWorker(context.Context, *api.Worker) error
++	// DeleteWorkerRegisterToken defines a function that deletes a worker
++	// register token by its token ID.
++	DeleteWorkerRegisterToken(context.Context, string) error
+ 	// GetWorker defines a function that gets a worker by ID.
+ 	GetWorker(context.Context, int64) (*api.Worker, error)
+ 	// GetWorkerForHostname defines a function that gets a worker by hostname.
+ 	GetWorkerForHostname(context.Context, string) (*api.Worker, error)
++	// GetWorkerRegisterToken defines a function that gets a worker
++	// register token by its token ID.
++	GetWorkerRegisterToken(context.Context, string) (*api.WorkerRegisterToken, error)
+ 	// ListWorkers defines a function that gets a list of all workers.
+ 	ListWorkers(context.Context, string, int64, int64) ([]*api.Worker, error)
+-	// UpdateWorker defines a function that updates an existing worker.
++	// UpdateWorker defines a function that conditionally updates an
++	// existing worker and rejects writes from a superseded generation.
+ 	UpdateWorker(context.Context, *api.Worker) (*api.Worker, error)
+ }
+diff --git a/database/worker/register_token.go b/database/worker/register_token.go
+new file mode 100644
+index 00000000..60b227c8
+--- /dev/null
++++ b/database/worker/register_token.go
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: Apache-2.0
++
++package worker
++
++import (
++	"context"
++
++	"github.com/sirupsen/logrus"
++
++	api "github.com/go-vela/server/api/types"
++	"github.com/go-vela/server/constants"
++	"github.com/go-vela/server/database/types"
++)
++
++// CreateWorkerRegisterToken stores a newly issued, single-use worker
++// registration token. The token's ID is the generation identifier the
++// signed register token carries; it stays "active" until exactly one
++// registration consumes it.
++func (e *Engine) CreateWorkerRegisterToken(ctx context.Context, r *api.WorkerRegisterToken) (*api.WorkerRegisterToken, error) {
++	e.logger.WithFields(logrus.Fields{
++		"worker": r.GetHostname(),
++	}).Tracef("creating worker register token for worker %s", r.GetHostname())
++
++	// cast the API type to database type
++	token := types.WorkerRegisterTokenFromAPI(r)
++
++	// validate the necessary fields are populated
++	err := token.Validate()
++	if err != nil {
++		return nil, err
++	}
++
++	// send query to the database
++	result := e.client.
++		WithContext(ctx).
++		Table(constants.TableWorkerRegisterToken).
++		Create(token)
++
++	return token.ToAPI(), result.Error
++}
++
++// GetWorkerRegisterToken gets a worker register token by its token ID
++// (the generation identifier embedded in the signed register token).
++func (e *Engine) GetWorkerRegisterToken(ctx context.Context, tokenID string) (*api.WorkerRegisterToken, error) {
++	e.logger.WithFields(logrus.Fields{
++		"token_id": tokenID,
++	}).Tracef("getting worker register token %s", tokenID)
++
++	// variable to store query results
++	r := new(types.WorkerRegisterToken)
++
++	// send query to the database and store result in variable
++	err := e.client.
++		WithContext(ctx).
++		Table(constants.TableWorkerRegisterToken).
++		Where("token_id = ?", tokenID).
++		Take(r).
++		Error
++	if err != nil {
++		return nil, err
++	}
++
++	// return the register token
++	return r.ToAPI(), nil
++}
++
++// DeleteWorkerRegisterToken deletes a worker register token by its
++// token ID. It is used to roll back a registration that could not be
++// completed (for example, when the signed token could not be minted).
++func (e *Engine) DeleteWorkerRegisterToken(ctx context.Context, tokenID string) error {
++	e.logger.WithFields(logrus.Fields{
++		"token_id": tokenID,
++	}).Tracef("deleting worker register token %s", tokenID)
++
++	return e.client.
++		WithContext(ctx).
++		Table(constants.TableWorkerRegisterToken).
++		Where("token_id = ?", tokenID).
++		Delete(new(types.WorkerRegisterToken)).
++		Error
++}
+diff --git a/database/worker/table.go b/database/worker/table.go
+index 45a54209..0d9f129c 100644
+--- a/database/worker/table.go
++++ b/database/worker/table.go
+@@ -26,6 +26,7 @@ workers (
+ 	last_build_finished_at BIGINT,
+ 	last_checked_in        BIGINT,
+ 	build_limit            INTEGER,
++	generation             VARCHAR(36),
+ 	UNIQUE(hostname)
+ );
+ `
+@@ -46,8 +47,42 @@ workers (
+ 	last_build_finished_at INTEGER,
+ 	last_checked_in	       INTEGER,
+ 	build_limit            INTEGER,
++	generation             TEXT,
+ 	UNIQUE(hostname)
+ );
++`
++
++	// CreatePostgresRegisterTokenTable represents a query to create the
++	// Postgres worker register tokens table. Each row is the server-side,
++	// single-use authorization for one worker registration (one worker
++	// lifecycle generation).
++	CreatePostgresRegisterTokenTable = `
++CREATE TABLE
++IF NOT EXISTS
++worker_register_tokens (
++	id         BIGSERIAL PRIMARY KEY,
++	token_id   VARCHAR(36) UNIQUE NOT NULL,
++	hostname   VARCHAR(250) NOT NULL,
++	status     VARCHAR(50) NOT NULL,
++	worker_id  BIGINT,
++	expires_at BIGINT NOT NULL,
++	created_at BIGINT NOT NULL
++);
++`
++	// CreateSqliteRegisterTokenTable represents a query to create the
++	// Sqlite worker register tokens table.
++	CreateSqliteRegisterTokenTable = `
++CREATE TABLE
++IF NOT EXISTS
++worker_register_tokens (
++	id         INTEGER PRIMARY KEY AUTOINCREMENT,
++	token_id   TEXT UNIQUE NOT NULL,
++	hostname   TEXT NOT NULL,
++	status     TEXT NOT NULL,
++	worker_id  INTEGER,
++	expires_at INTEGER NOT NULL,
++	created_at INTEGER NOT NULL
++);
+ `
+ )
+ 
+@@ -71,3 +106,25 @@ func (e *Engine) CreateWorkerTable(ctx context.Context, driver string) error {
+ 			Exec(CreateSqliteTable).Error
+ 	}
+ }
++
++// CreateWorkerRegisterTokenTable creates the worker register tokens
++// table in the database.
++func (e *Engine) CreateWorkerRegisterTokenTable(ctx context.Context, driver string) error {
++	e.logger.Tracef("creating worker register tokens table")
++
++	// handle the driver provided to create the table
++	switch driver {
++	case constants.DriverPostgres:
++		// create the worker register tokens table for Postgres
++		return e.client.
++			WithContext(ctx).
++			Exec(CreatePostgresRegisterTokenTable).Error
++	case constants.DriverSqlite:
++		fallthrough
++	default:
++		// create the worker register tokens table for Sqlite
++		return e.client.
++			WithContext(ctx).
++			Exec(CreateSqliteRegisterTokenTable).Error
++	}
++}
+diff --git a/database/worker/update.go b/database/worker/update.go
+index 33540a4d..52e2c414 100644
+--- a/database/worker/update.go
++++ b/database/worker/update.go
+@@ -13,6 +13,15 @@ import (
+ )
+ 
+ // UpdateWorker updates an existing worker in the database.
++//
++// The write is conditional on the worker's current lifecycle
++// generation: a generation-bound worker is only updated when the
++// caller's record still carries the same generation recorded in the
++// database. If the worker was deleted and recreated (a newer
++// generation) after the caller loaded its record, the update matches
++// no rows and ErrStaleWorker is returned, preventing late requests
++// from an older generation from overwriting the new worker's address,
++// routes, running builds, status, or check-in time.
+ func (e *Engine) UpdateWorker(ctx context.Context, w *api.Worker) (*api.Worker, error) {
+ 	e.logger.WithFields(logrus.Fields{
+ 		"worker": w.GetHostname(),
+@@ -27,11 +36,32 @@ func (e *Engine) UpdateWorker(ctx context.Context, w *api.Worker) (*api.Worker,
+ 		return nil, err
+ 	}
+ 
+-	// send query to the database
+-	result := e.client.
++	// build the conditional write. the statement is an explicit UPDATE
++	// (never an upsert). gorm restricts struct updates to the record's
++	// primary key; bound generations additionally require the stored
++	// generation to match, while legacy and symmetric workers (no
++	// generation) match on ID only.
++	query := e.client.
+ 		WithContext(ctx).
+-		Table(constants.TableWorker).
+-		Save(worker)
++		Table(constants.TableWorker)
+ 
+-	return worker.ToAPI(w.GetRunningBuilds()), result.Error
++	if len(w.GetGeneration()) > 0 {
++		query = query.Where("generation = ?", w.GetGeneration())
++	}
++
++	// send query to the database. Select("*") ensures every column
++	// (including zero-valued ones) is written, matching prior Save
++	// behavior, while never inserting a missing or stale row.
++	result := query.Select("*").Updates(worker)
++	if result.Error != nil {
++		return nil, result.Error
++	}
++
++	// no row matched: the record belongs to a deleted or superseded
++	// generation and the write must not land on a newer same-hostname row
++	if result.RowsAffected == 0 {
++		return nil, ErrStaleWorker
++	}
++
++	return worker.ToAPI(w.GetRunningBuilds()), nil
+ }
+diff --git a/database/worker/update_test.go b/database/worker/update_test.go
+index dd70b51c..e94f2416 100644
+--- a/database/worker/update_test.go
++++ b/database/worker/update_test.go
+@@ -22,11 +22,12 @@ func TestWorker_Engine_UpdateWorker(t *testing.T) {
+ 
+ 	defer func() { _sql, _ := _postgres.client.DB(); _sql.Close() }()
+ 
+-	// ensure the mock expects the query
++	// ensure the mock expects the query (legacy worker without a
++	// generation is conditionally updated on its primary key only)
+ 	_mock.ExpectExec(`UPDATE "workers"
+-SET "hostname"=$1,"address"=$2,"routes"=$3,"active"=$4,"status"=$5,"last_status_update_at"=$6,"running_build_ids"=$7,"last_build_started_at"=$8,"last_build_finished_at"=$9,"last_checked_in"=$10,"build_limit"=$11
+-WHERE "id" = $12`).
+-		WithArgs("worker_0", "localhost", nil, true, nil, nil, `{"1"}`, nil, nil, nil, nil, 1).
++SET "hostname"=$1,"address"=$2,"routes"=$3,"active"=$4,"status"=$5,"last_status_update_at"=$6,"running_build_ids"=$7,"last_build_started_at"=$8,"last_build_finished_at"=$9,"last_checked_in"=$10,"build_limit"=$11,"generation"=$12
++WHERE "id" = $13`).
++		WithArgs("worker_0", "localhost", nil, true, nil, nil, `{"1"}`, nil, nil, nil, nil, nil, 1).
+ 		WillReturnResult(sqlmock.NewResult(1, 1))
+ 
+ 	_sqlite := testSqlite(t)
+diff --git a/database/worker/worker.go b/database/worker/worker.go
+index 35a31c30..449d413c 100644
+--- a/database/worker/worker.go
++++ b/database/worker/worker.go
+@@ -4,8 +4,10 @@ package worker
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"strconv"
++	"strings"
+ 
+ 	"github.com/sirupsen/logrus"
+ 	"gorm.io/gorm"
+@@ -77,9 +79,67 @@ func New(opts ...EngineOpt) (*Engine, error) {
+ 		return nil, fmt.Errorf("unable to create indexes for %s table: %w", constants.TableWorker, err)
+ 	}
+ 
++	// ensure workers created before generations existed gain the generation column
++	err = e.ensureWorkerGeneration(e.ctx, e.client.Config.Dialector.Name())
++	if err != nil {
++		return nil, fmt.Errorf("unable to upgrade %s table: %w", constants.TableWorker, err)
++	}
++
++	// create the worker register tokens table
++	err = e.CreateWorkerRegisterTokenTable(e.ctx, e.client.Config.Dialector.Name())
++	if err != nil {
++		return nil, fmt.Errorf("unable to create %s table: %w", constants.TableWorkerRegisterToken, err)
++	}
++
++	// create the indexes for the worker register tokens table
++	err = e.CreateWorkerRegisterTokenIndexes(e.ctx)
++	if err != nil {
++		return nil, fmt.Errorf("unable to create indexes for %s table: %w", constants.TableWorkerRegisterToken, err)
++	}
++
+ 	return e, nil
+ }
+ 
++// ensureWorkerGeneration makes sure the generation column exists on a
++// workers table created by an older version of the server. Postgres
++// supports an idempotent ADD COLUMN statement; Sqlite does not, so a
++// duplicate-column error is expected and ignored on Sqlite.
++func (e *Engine) ensureWorkerGeneration(ctx context.Context, driver string) error {
++	e.logger.Tracef("ensuring workers table has generation column")
++
++	switch driver {
++	case constants.DriverPostgres:
++		return e.client.
++			WithContext(ctx).
++			Exec(AlterPostgresWorkerGeneration).Error
++	case constants.DriverSqlite:
++		fallthrough
++	default:
++		err := e.client.
++			WithContext(ctx).
++			Exec(AlterSqliteWorkerGeneration).Error
++		if err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
++			// the column already exists, nothing to upgrade
++			return nil
++		}
++
++		return err
++	}
++}
++
++// sentinel errors for worker lifecycle generation operations.
++var (
++	// ErrInvalidWorkerRegisterToken is returned when a register token
++	// cannot establish a worker generation because it is unknown,
++	// already used, expired, or scoped to a different hostname.
++	ErrInvalidWorkerRegisterToken = errors.New("invalid or consumed worker registration token")
++
++	// ErrStaleWorker is returned when a conditional worker write affects
++	// no rows because the worker was deleted and recreated as a newer
++	// generation after the request loaded its record.
++	ErrStaleWorker = errors.New("worker record is stale; the worker generation no longer exists")
++)
++
+ // convertToBuilds is a helper function that generates build objects with ID fields given a list of IDs.
+ func convertToBuilds(ids []string) []*api.Build {
+ 	// create stripped build objects holding the IDs
+diff --git a/database/worker/worker_test.go b/database/worker/worker_test.go
+index 52805c0a..1f0b6c36 100644
+--- a/database/worker/worker_test.go
++++ b/database/worker/worker_test.go
+@@ -27,6 +27,9 @@ func TestWorker_New(t *testing.T) {
+ 
+ 	_mock.ExpectExec(CreatePostgresTable).WillReturnResult(sqlmock.NewResult(1, 1))
+ 	_mock.ExpectExec(CreateHostnameAddressIndex).WillReturnResult(sqlmock.NewResult(1, 1))
++	_mock.ExpectExec(AlterPostgresWorkerGeneration).WillReturnResult(sqlmock.NewResult(1, 1))
++	_mock.ExpectExec(CreatePostgresRegisterTokenTable).WillReturnResult(sqlmock.NewResult(1, 1))
++	_mock.ExpectExec(CreateRegisterTokenHostnameIndex).WillReturnResult(sqlmock.NewResult(1, 1))
+ 
+ 	_config := &gorm.Config{SkipDefaultTransaction: true}
+ 
+@@ -160,6 +163,9 @@ func testPostgres(t *testing.T) (*Engine, sqlmock.Sqlmock) {
+ 
+ 	_mock.ExpectExec(CreatePostgresTable).WillReturnResult(sqlmock.NewResult(1, 1))
+ 	_mock.ExpectExec(CreateHostnameAddressIndex).WillReturnResult(sqlmock.NewResult(1, 1))
++	_mock.ExpectExec(AlterPostgresWorkerGeneration).WillReturnResult(sqlmock.NewResult(1, 1))
++	_mock.ExpectExec(CreatePostgresRegisterTokenTable).WillReturnResult(sqlmock.NewResult(1, 1))
++	_mock.ExpectExec(CreateRegisterTokenHostnameIndex).WillReturnResult(sqlmock.NewResult(1, 1))
+ 
+ 	// create the new mock Postgres database client
+ 	//
+diff --git a/internal/token/mint.go b/internal/token/mint.go
+index 3a064b1c..95ff7424 100644
+--- a/internal/token/mint.go
++++ b/internal/token/mint.go
+@@ -34,6 +34,14 @@ type Claims struct {
+ 	Image       string `json:"image,omitempty"`
+ 	Request     string `json:"request,omitempty"`
+ 	Commands    bool   `json:"commands,omitempty"`
++
++	// Generation is the worker lifecycle generation this token is valid
++	// for. Register tokens carry the generation they are authorized to
++	// establish; worker auth tokens carry the generation they may act on.
++	// An empty value only represents workers and tokens created before
++	// generations existed.
++	Generation string `json:"worker_generation,omitempty"`
++
+ 	jwt.RegisteredClaims
+ }
+ 
+@@ -50,6 +58,10 @@ type MintTokenOpts struct {
+ 	Image         string
+ 	Request       string
+ 	Commands      bool
++
++	// Generation is the worker lifecycle generation the worker register
++	// or auth token must be scoped to.
++	Generation string
+ }
+ 
+ // MintToken mints a Vela JWT Token given a set of options.
+@@ -91,6 +103,7 @@ func (tm *Manager) MintToken(mto *MintTokenOpts) (string, error) {
+ 		}
+ 
+ 		claims.Subject = mto.Hostname
++		claims.Generation = mto.Generation
+ 
+ 	case constants.IDRequestTokenType:
+ 		if len(mto.Repo) == 0 {
+diff --git a/mock/server/worker_test.go b/mock/server/worker_test.go
+index 34d6aa80..56aecd86 100644
+--- a/mock/server/worker_test.go
++++ b/mock/server/worker_test.go
+@@ -21,6 +21,12 @@ func TestWorker_ActiveWorkerResp(t *testing.T) {
+ 	tWorker := reflect.TypeFor[api.Worker]()
+ 
+ 	for i := 0; i < tWorker.NumField(); i++ {
++		// fields excluded from JSON (json:"-") cannot be populated by
++		// unmarshaling and are not part of the response contract
++		if name, ok := tWorker.Field(i).Tag.Lookup("json"); ok && name == "-" {
++			continue
++		}
++
+ 		if reflect.ValueOf(testWorker).Field(i).IsNil() {
+ 			t.Errorf("WorkerResp missing field %s", tWorker.Field(i).Name)
+ 		}
+@@ -39,6 +45,12 @@ func TestWorker_ListActiveWorkerResp(t *testing.T) {
+ 		tWorker := reflect.TypeFor[api.Worker]()
+ 
+ 		for i := 0; i < tWorker.NumField(); i++ {
++			// fields excluded from JSON (json:"-") cannot be populated by
++			// unmarshaling and are not part of the response contract
++			if name, ok := tWorker.Field(i).Tag.Lookup("json"); ok && name == "-" {
++				continue
++			}
++
+ 			if reflect.ValueOf(worker).Field(i).IsNil() {
+ 				t.Errorf("WorkersResp index %d missing field %s", index, tWorker.Field(i).Name)
+ 			}
+diff --git a/router/middleware/perm/perm.go b/router/middleware/perm/perm.go
+index b11a035b..f0adaa17 100644
+--- a/router/middleware/perm/perm.go
++++ b/router/middleware/perm/perm.go
+@@ -98,7 +98,10 @@ func MustWorkerAuthToken() gin.HandlerFunc {
+ 		}
+ 
+ 		switch cl.TokenType {
+-		case constants.WorkerAuthTokenType, constants.WorkerRegisterTokenType:
++		// a worker auth token acts on the generation it was minted for;
++		// the generation is verified against the worker record by the
++		// worker handlers
++		case constants.WorkerAuthTokenType:
+ 			return
+ 		case constants.ServerWorkerTokenType:
+ 			if cl.Subject == "vela-worker" {
+@@ -110,6 +113,9 @@ func MustWorkerAuthToken() gin.HandlerFunc {
+ 
+ 			return
+ 		default:
++			// worker register tokens can only establish their authorized
++			// generation and are never accepted for worker updates or
++			// token refresh
+ 			retErr := fmt.Errorf("invalid token type: must provide a worker auth token")
+ 			util.HandleError(c, http.StatusUnauthorized, retErr)
+ 

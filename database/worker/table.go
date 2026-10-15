@@ -26,6 +26,7 @@ workers (
 	last_build_finished_at BIGINT,
 	last_checked_in        BIGINT,
 	build_limit            INTEGER,
+	generation             VARCHAR(36),
 	UNIQUE(hostname)
 );
 `
@@ -46,7 +47,41 @@ workers (
 	last_build_finished_at INTEGER,
 	last_checked_in	       INTEGER,
 	build_limit            INTEGER,
+	generation             TEXT,
 	UNIQUE(hostname)
+);
+`
+
+	// CreatePostgresRegisterTokenTable represents a query to create the
+	// Postgres worker register tokens table. Each row is the server-side,
+	// single-use authorization for one worker registration (one worker
+	// lifecycle generation).
+	CreatePostgresRegisterTokenTable = `
+CREATE TABLE
+IF NOT EXISTS
+worker_register_tokens (
+	id         BIGSERIAL PRIMARY KEY,
+	token_id   VARCHAR(36) UNIQUE NOT NULL,
+	hostname   VARCHAR(250) NOT NULL,
+	status     VARCHAR(50) NOT NULL,
+	worker_id  BIGINT,
+	expires_at BIGINT NOT NULL,
+	created_at BIGINT NOT NULL
+);
+`
+	// CreateSqliteRegisterTokenTable represents a query to create the
+	// Sqlite worker register tokens table.
+	CreateSqliteRegisterTokenTable = `
+CREATE TABLE
+IF NOT EXISTS
+worker_register_tokens (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	token_id   TEXT UNIQUE NOT NULL,
+	hostname   TEXT NOT NULL,
+	status     TEXT NOT NULL,
+	worker_id  INTEGER,
+	expires_at INTEGER NOT NULL,
+	created_at INTEGER NOT NULL
 );
 `
 )
@@ -69,5 +104,27 @@ func (e *Engine) CreateWorkerTable(ctx context.Context, driver string) error {
 		return e.client.
 			WithContext(ctx).
 			Exec(CreateSqliteTable).Error
+	}
+}
+
+// CreateWorkerRegisterTokenTable creates the worker register tokens
+// table in the database.
+func (e *Engine) CreateWorkerRegisterTokenTable(ctx context.Context, driver string) error {
+	e.logger.Tracef("creating worker register tokens table")
+
+	// handle the driver provided to create the table
+	switch driver {
+	case constants.DriverPostgres:
+		// create the worker register tokens table for Postgres
+		return e.client.
+			WithContext(ctx).
+			Exec(CreatePostgresRegisterTokenTable).Error
+	case constants.DriverSqlite:
+		fallthrough
+	default:
+		// create the worker register tokens table for Sqlite
+		return e.client.
+			WithContext(ctx).
+			Exec(CreateSqliteRegisterTokenTable).Error
 	}
 }

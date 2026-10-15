@@ -2742,7 +2742,35 @@ func testWorkers(t *testing.T, db Interface, resources *Resources) {
 	methods["UpdateWorker"] = true
 	methods["GetWorker"] = true
 
-	// delete the workers
+	// exercise the single-use register token lifecycle used to establish
+	// worker lifecycle generations
+	_registerToken := new(api.WorkerRegisterToken)
+	_registerToken.SetTokenID("01923b64-0000-7000-9000-000000000001")
+	_registerToken.SetHostname(resources.Workers[0].GetHostname())
+	_registerToken.SetStatus(constants.WorkerRegisterTokenStatusActive)
+	_registerToken.SetCreatedAt(time.Now().Unix())
+	_registerToken.SetExpiresAt(time.Now().Add(time.Hour).Unix())
+
+	_registerToken, err = db.CreateWorkerRegisterToken(context.TODO(), _registerToken)
+	if err != nil {
+		t.Errorf("unable to create worker register token: %v", err)
+	}
+
+	methods["CreateWorkerRegisterToken"] = true
+
+	_gotToken, err := db.GetWorkerRegisterToken(context.TODO(), _registerToken.GetTokenID())
+	if err != nil {
+		t.Errorf("unable to get worker register token: %v", err)
+	}
+
+	if !cmp.Equal(_gotToken, _registerToken) {
+		t.Errorf("GetWorkerRegisterToken() is %v, want %v", _gotToken, _registerToken)
+	}
+
+	methods["GetWorkerRegisterToken"] = true
+
+	// delete the workers, which must also revoke the register token
+	// issued for the first worker's hostname
 	for _, worker := range resources.Workers {
 		err = db.DeleteWorker(context.TODO(), worker)
 		if err != nil {
@@ -2751,6 +2779,33 @@ func testWorkers(t *testing.T, db Interface, resources *Resources) {
 	}
 
 	methods["DeleteWorker"] = true
+
+	// deleting a worker must have removed register tokens for its hostname
+	_, err = db.GetWorkerRegisterToken(context.TODO(), _registerToken.GetTokenID())
+	if err == nil {
+		t.Errorf("GetWorkerRegisterToken() should not find token %s after worker delete", _registerToken.GetTokenID())
+	}
+
+	// exercise explicit register token deletion as well (rollback of a
+	// registration that could not complete)
+	_registerTokenTwo := new(api.WorkerRegisterToken)
+	_registerTokenTwo.SetTokenID("01923b64-0000-7000-9000-000000000002")
+	_registerTokenTwo.SetHostname("worker-unregistered.example.com")
+	_registerTokenTwo.SetStatus(constants.WorkerRegisterTokenStatusActive)
+	_registerTokenTwo.SetCreatedAt(time.Now().Unix())
+	_registerTokenTwo.SetExpiresAt(time.Now().Add(time.Hour).Unix())
+
+	_, err = db.CreateWorkerRegisterToken(context.TODO(), _registerTokenTwo)
+	if err != nil {
+		t.Errorf("unable to create second worker register token: %v", err)
+	}
+
+	err = db.DeleteWorkerRegisterToken(context.TODO(), _registerTokenTwo.GetTokenID())
+	if err != nil {
+		t.Errorf("unable to delete worker register token: %v", err)
+	}
+
+	methods["DeleteWorkerRegisterToken"] = true
 
 	// ensure we called all the methods we expected to
 	for method, called := range methods {

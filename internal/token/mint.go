@@ -34,6 +34,14 @@ type Claims struct {
 	Image       string `json:"image,omitempty"`
 	Request     string `json:"request,omitempty"`
 	Commands    bool   `json:"commands,omitempty"`
+
+	// Generation is the worker lifecycle generation this token is valid
+	// for. Register tokens carry the generation they are authorized to
+	// establish; worker auth tokens carry the generation they may act on.
+	// An empty value only represents workers and tokens created before
+	// generations existed.
+	Generation string `json:"worker_generation,omitempty"`
+
 	jwt.RegisteredClaims
 }
 
@@ -50,6 +58,10 @@ type MintTokenOpts struct {
 	Image         string
 	Request       string
 	Commands      bool
+
+	// Generation is the worker lifecycle generation the worker register
+	// or auth token must be scoped to.
+	Generation string
 }
 
 // MintToken mints a Vela JWT Token given a set of options.
@@ -91,6 +103,7 @@ func (tm *Manager) MintToken(mto *MintTokenOpts) (string, error) {
 		}
 
 		claims.Subject = mto.Hostname
+		claims.Generation = mto.Generation
 
 	case constants.IDRequestTokenType:
 		if len(mto.Repo) == 0 {

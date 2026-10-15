@@ -3,6 +3,7 @@
 package worker
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/go-vela/server/database"
+	dbworker "github.com/go-vela/server/database/worker"
 	"github.com/go-vela/server/router/middleware/worker"
 	"github.com/go-vela/server/util"
 )
@@ -60,9 +62,19 @@ func DeleteWorker(c *gin.Context) {
 
 	l.Debugf("deleting worker %s", w.GetHostname())
 
-	// send API call to remove the step
+	// send API call to remove the worker and revoke all of its
+	// register tokens
 	err := database.FromContext(c).DeleteWorker(ctx, w)
 	if err != nil {
+		// the worker was already removed by a concurrent request
+		if errors.Is(err, dbworker.ErrStaleWorker) {
+			retErr := fmt.Errorf("unable to delete worker %s: %w", w.GetHostname(), err)
+
+			util.HandleError(c, http.StatusNotFound, retErr)
+
+			return
+		}
+
 		retErr := fmt.Errorf("unable to delete worker %s: %w", w.GetHostname(), err)
 
 		util.HandleError(c, http.StatusInternalServerError, retErr)

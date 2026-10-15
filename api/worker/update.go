@@ -3,6 +3,7 @@
 package worker
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -10,7 +11,10 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/go-vela/server/api/types"
+	"github.com/go-vela/server/constants"
 	"github.com/go-vela/server/database"
+	dbworker "github.com/go-vela/server/database/worker"
+	"github.com/go-vela/server/router/middleware/claims"
 	"github.com/go-vela/server/router/middleware/worker"
 	"github.com/go-vela/server/util"
 )
@@ -63,8 +67,29 @@ import (
 func UpdateWorker(c *gin.Context) {
 	// capture middleware values
 	l := c.MustGet("logger").(*logrus.Entry)
+	cl := claims.Retrieve(c)
 	w := worker.Retrieve(c)
 	ctx := c.Request.Context()
+
+	// an auth token may only update the worker generation it was minted
+	// for. this stops auth tokens from a deleted generation from
+	// updating a newer same-hostname worker. platform admin users and the
+	// explicitly configured shared symmetric server-worker token bypass
+	// generation enforcement.
+	if !cl.IsAdmin &&
+		cl.TokenType != constants.ServerWorkerTokenType &&
+		cl.Generation != w.GetGeneration() {
+		l.WithFields(logrus.Fields{
+			"claims_generation": cl.Generation,
+			"worker_generation": w.GetGeneration(),
+		}).Warnf("rejected update for worker %s from a different generation", w.GetHostname())
+
+		retErr := fmt.Errorf("unable to update worker %s: auth token is not valid for the current worker generation", w.GetHostname())
+
+		util.HandleError(c, http.StatusUnauthorized, retErr)
+
+		return
+	}
 
 	l.Debugf("updating worker %s", w.GetHostname())
 
@@ -123,6 +148,17 @@ func UpdateWorker(c *gin.Context) {
 	// send API call to update the worker
 	w, err = database.FromContext(c).UpdateWorker(ctx, w)
 	if err != nil {
+		// the worker was deleted and recreated as a newer generation
+		// between loading the record and writing it; the stale write was
+		// conditionally rejected
+		if errors.Is(err, dbworker.ErrStaleWorker) {
+			retErr := fmt.Errorf("unable to update worker %s: %w", w.GetHostname(), err)
+
+			util.HandleError(c, http.StatusConflict, retErr)
+
+			return
+		}
+
 		retErr := fmt.Errorf("unable to update worker %s: %w", w.GetHostname(), err)
 
 		util.HandleError(c, http.StatusInternalServerError, retErr)

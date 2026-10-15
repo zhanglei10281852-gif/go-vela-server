@@ -3,6 +3,7 @@
 package worker
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/go-vela/server/api/types"
 	"github.com/go-vela/server/constants"
 	"github.com/go-vela/server/database"
+	dbworker "github.com/go-vela/server/database/worker"
 	"github.com/go-vela/server/internal/token"
 	"github.com/go-vela/server/router/middleware/claims"
 	"github.com/go-vela/server/router/middleware/worker"
@@ -52,6 +54,10 @@ import (
 //     description: Not found
 //     schema:
 //       "$ref": "#/definitions/Error"
+//   '409':
+//     description: Worker generation superseded
+//     schema:
+//       "$ref": "#/definitions/Error"
 //   '500':
 //     description: Unexpected server error
 //     schema:
@@ -66,6 +72,17 @@ func Refresh(c *gin.Context) {
 	cl := claims.Retrieve(c)
 	ctx := c.Request.Context()
 
+	// register tokens may only establish a generation; they can never be
+	// used to refresh auth for an established generation
+	if cl.TokenType != constants.WorkerAuthTokenType &&
+		!strings.EqualFold(cl.TokenType, constants.ServerWorkerTokenType) {
+		retErr := fmt.Errorf("unable to refresh worker auth: invalid token type, a worker auth token is required")
+
+		util.HandleError(c, http.StatusUnauthorized, retErr)
+
+		return
+	}
+
 	// if we are not using a symmetric token, and the subject does not match the input, request should be denied
 	if !strings.EqualFold(cl.TokenType, constants.ServerWorkerTokenType) && !strings.EqualFold(cl.Subject, w.GetHostname()) {
 		retErr := fmt.Errorf("unable to refresh worker auth: claims subject %s does not match worker hostname %s", cl.Subject, w.GetHostname())
@@ -77,12 +94,41 @@ func Refresh(c *gin.Context) {
 		return
 	}
 
+	// the auth token may only refresh the generation it was minted for;
+	// a token from a deleted generation can never refresh a newer
+	// same-hostname worker. symmetric tokens and platform admins bypass
+	// generation enforcement.
+	if !cl.IsAdmin &&
+		!strings.EqualFold(cl.TokenType, constants.ServerWorkerTokenType) &&
+		cl.Generation != w.GetGeneration() {
+		l.WithFields(logrus.Fields{
+			"claims_generation": cl.Generation,
+			"worker_generation": w.GetGeneration(),
+		}).Warnf("rejected refresh for worker %s from a different generation", w.GetHostname())
+
+		retErr := fmt.Errorf("unable to refresh worker auth: token is not valid for the current generation of worker %s", w.GetHostname())
+
+		util.HandleError(c, http.StatusUnauthorized, retErr)
+
+		return
+	}
+
 	// set last checked in time
 	w.SetLastCheckedIn(time.Now().Unix())
 
-	// send API call to update the worker
+	// send API call to update the worker; the write is conditional on the
+	// generation still matching, so a late check-in cannot overwrite a
+	// recreated worker
 	_, err := database.FromContext(c).UpdateWorker(ctx, w)
 	if err != nil {
+		if errors.Is(err, dbworker.ErrStaleWorker) {
+			retErr := fmt.Errorf("unable to update worker %s: %w", w.GetHostname(), err)
+
+			util.HandleError(c, http.StatusConflict, retErr)
+
+			return
+		}
+
 		retErr := fmt.Errorf("unable to update worker %s: %w", w.GetHostname(), err)
 
 		util.HandleError(c, http.StatusInternalServerError, retErr)
@@ -110,14 +156,16 @@ func Refresh(c *gin.Context) {
 		util.HandleError(c, http.StatusBadRequest, retErr)
 
 		return
-	// if worker auth / register token, send back auth token
-	case constants.WorkerAuthTokenType, constants.WorkerRegisterTokenType:
+	// if worker auth token, send back a new auth token scoped to the
+	// same generation
+	case constants.WorkerAuthTokenType:
 		tm := c.MustGet("token-manager").(*token.Manager)
 
 		wmto := &token.MintTokenOpts{
 			TokenType:     constants.WorkerAuthTokenType,
 			TokenDuration: tm.WorkerAuthTokenDuration,
 			Hostname:      cl.Subject,
+			Generation:    w.GetGeneration(),
 		}
 
 		tkn := new(types.Token)

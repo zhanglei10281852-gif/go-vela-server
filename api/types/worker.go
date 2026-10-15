@@ -22,6 +22,13 @@ type Worker struct {
 	LastBuildFinishedAt *int64    `json:"last_build_finished_at,omitempty"`
 	LastCheckedIn       *int64    `json:"last_checked_in,omitempty"`
 	BuildLimit          *int32    `json:"build_limit,omitempty"`
+
+	// Generation identifies the worker lifecycle generation this record
+	// belongs to. It is established at registration and must match the
+	// generation claim on every worker auth token. It is never exposed
+	// through the API and is empty for the shared symmetric token mode
+	// and workers created before generations existed.
+	Generation *string `json:"-"`
 }
 
 // GetID returns the ID field.
@@ -180,6 +187,19 @@ func (w *Worker) GetBuildLimit() int32 {
 	return *w.BuildLimit
 }
 
+// GetGeneration returns the Generation field.
+//
+// When the provided Worker type is nil, or the field within
+// the type is nil, it returns the zero value for the field.
+func (w *Worker) GetGeneration() string {
+	// return zero value if Worker type or Generation field is nil
+	if w == nil || w.Generation == nil {
+		return ""
+	}
+
+	return *w.Generation
+}
+
 // SetID sets the ID field.
 //
 // When the provided Worker type is nil, it
@@ -334,6 +354,19 @@ func (w *Worker) SetBuildLimit(v int32) {
 	}
 
 	w.BuildLimit = &v
+}
+
+// SetGeneration sets the Generation field.
+//
+// When the provided Worker type is nil, it
+// will set nothing and immediately return.
+func (w *Worker) SetGeneration(v string) {
+	// return if Worker type is nil
+	if w == nil {
+		return
+	}
+
+	w.Generation = &v
 }
 
 // String implements the Stringer interface for the Worker type.

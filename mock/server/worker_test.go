@@ -21,6 +21,12 @@ func TestWorker_ActiveWorkerResp(t *testing.T) {
 	tWorker := reflect.TypeFor[api.Worker]()
 
 	for i := 0; i < tWorker.NumField(); i++ {
+		// fields excluded from JSON (json:"-") cannot be populated by
+		// unmarshaling and are not part of the response contract
+		if name, ok := tWorker.Field(i).Tag.Lookup("json"); ok && name == "-" {
+			continue
+		}
+
 		if reflect.ValueOf(testWorker).Field(i).IsNil() {
 			t.Errorf("WorkerResp missing field %s", tWorker.Field(i).Name)
 		}
@@ -39,6 +45,12 @@ func TestWorker_ListActiveWorkerResp(t *testing.T) {
 		tWorker := reflect.TypeFor[api.Worker]()
 
 		for i := 0; i < tWorker.NumField(); i++ {
+			// fields excluded from JSON (json:"-") cannot be populated by
+			// unmarshaling and are not part of the response contract
+			if name, ok := tWorker.Field(i).Tag.Lookup("json"); ok && name == "-" {
+				continue
+			}
+
 			if reflect.ValueOf(worker).Field(i).IsNil() {
 				t.Errorf("WorkersResp index %d missing field %s", index, tWorker.Field(i).Name)
 			}

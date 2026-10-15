@@ -80,6 +80,9 @@ func TestDatabase_Engine_NewResources(t *testing.T) {
 	// ensure the mock expects the worker queries
 	_mock.ExpectExec(worker.CreatePostgresTable).WillReturnResult(sqlmock.NewResult(1, 1))
 	_mock.ExpectExec(worker.CreateHostnameAddressIndex).WillReturnResult(sqlmock.NewResult(1, 1))
+	_mock.ExpectExec(worker.AlterPostgresWorkerGeneration).WillReturnResult(sqlmock.NewResult(1, 1))
+	_mock.ExpectExec(worker.CreatePostgresRegisterTokenTable).WillReturnResult(sqlmock.NewResult(1, 1))
+	_mock.ExpectExec(worker.CreateRegisterTokenHostnameIndex).WillReturnResult(sqlmock.NewResult(1, 1))
 
 	// create a test database without mocking the call
 	_unmocked, _ := testPostgres(t)

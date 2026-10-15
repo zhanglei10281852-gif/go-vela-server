@@ -98,7 +98,10 @@ func MustWorkerAuthToken() gin.HandlerFunc {
 		}
 
 		switch cl.TokenType {
-		case constants.WorkerAuthTokenType, constants.WorkerRegisterTokenType:
+		// a worker auth token acts on the generation it was minted for;
+		// the generation is verified against the worker record by the
+		// worker handlers
+		case constants.WorkerAuthTokenType:
 			return
 		case constants.ServerWorkerTokenType:
 			if cl.Subject == "vela-worker" {
@@ -110,6 +113,9 @@ func MustWorkerAuthToken() gin.HandlerFunc {
 
 			return
 		default:
+			// worker register tokens can only establish their authorized
+			// generation and are never accepted for worker updates or
+			// token refresh
 			retErr := fmt.Errorf("invalid token type: must provide a worker auth token")
 			util.HandleError(c, http.StatusUnauthorized, retErr)
 

@@ -54,4 +54,9 @@ const (
 
 	// TableWorker defines the table type for the database workers table.
 	TableWorker = "workers"
+
+	// TableWorkerRegisterToken defines the table type for the database
+	// worker register tokens table. Each row authorizes exactly one
+	// worker registration (one worker lifecycle generation).
+	TableWorkerRegisterToken = "worker_register_tokens"
 )

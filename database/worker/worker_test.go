@@ -27,6 +27,9 @@ func TestWorker_New(t *testing.T) {
 
 	_mock.ExpectExec(CreatePostgresTable).WillReturnResult(sqlmock.NewResult(1, 1))
 	_mock.ExpectExec(CreateHostnameAddressIndex).WillReturnResult(sqlmock.NewResult(1, 1))
+	_mock.ExpectExec(AlterPostgresWorkerGeneration).WillReturnResult(sqlmock.NewResult(1, 1))
+	_mock.ExpectExec(CreatePostgresRegisterTokenTable).WillReturnResult(sqlmock.NewResult(1, 1))
+	_mock.ExpectExec(CreateRegisterTokenHostnameIndex).WillReturnResult(sqlmock.NewResult(1, 1))
 
 	_config := &gorm.Config{SkipDefaultTransaction: true}
 
@@ -160,6 +163,9 @@ func testPostgres(t *testing.T) (*Engine, sqlmock.Sqlmock) {
 
 	_mock.ExpectExec(CreatePostgresTable).WillReturnResult(sqlmock.NewResult(1, 1))
 	_mock.ExpectExec(CreateHostnameAddressIndex).WillReturnResult(sqlmock.NewResult(1, 1))
+	_mock.ExpectExec(AlterPostgresWorkerGeneration).WillReturnResult(sqlmock.NewResult(1, 1))
+	_mock.ExpectExec(CreatePostgresRegisterTokenTable).WillReturnResult(sqlmock.NewResult(1, 1))
+	_mock.ExpectExec(CreateRegisterTokenHostnameIndex).WillReturnResult(sqlmock.NewResult(1, 1))
 
 	// create the new mock Postgres database client
 	//

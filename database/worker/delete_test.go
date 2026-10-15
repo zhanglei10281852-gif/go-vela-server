@@ -21,10 +21,16 @@ func TestWorker_Engine_DeleteWorker(t *testing.T) {
 
 	defer func() { _sql, _ := _postgres.client.DB(); _sql.Close() }()
 
-	// ensure the mock expects the query
+	// ensure the mock expects the transactional delete: the worker row is
+	// removed and every register token issued for its hostname is revoked
+	_mock.ExpectBegin()
 	_mock.ExpectExec(`DELETE FROM "workers" WHERE "workers"."id" = $1`).
 		WithArgs(1).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	_mock.ExpectExec(`DELETE FROM "worker_register_tokens" WHERE hostname = $1`).
+		WithArgs("worker_0").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	_mock.ExpectCommit()
 
 	_sqlite := testSqlite(t)
 

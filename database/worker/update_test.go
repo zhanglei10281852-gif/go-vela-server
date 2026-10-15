@@ -22,11 +22,12 @@ func TestWorker_Engine_UpdateWorker(t *testing.T) {
 
 	defer func() { _sql, _ := _postgres.client.DB(); _sql.Close() }()
 
-	// ensure the mock expects the query
+	// ensure the mock expects the query (legacy worker without a
+	// generation is conditionally updated on its primary key only)
 	_mock.ExpectExec(`UPDATE "workers"
-SET "hostname"=$1,"address"=$2,"routes"=$3,"active"=$4,"status"=$5,"last_status_update_at"=$6,"running_build_ids"=$7,"last_build_started_at"=$8,"last_build_finished_at"=$9,"last_checked_in"=$10,"build_limit"=$11
-WHERE "id" = $12`).
-		WithArgs("worker_0", "localhost", nil, true, nil, nil, `{"1"}`, nil, nil, nil, nil, 1).
+SET "hostname"=$1,"address"=$2,"routes"=$3,"active"=$4,"status"=$5,"last_status_update_at"=$6,"running_build_ids"=$7,"last_build_started_at"=$8,"last_build_finished_at"=$9,"last_checked_in"=$10,"build_limit"=$11,"generation"=$12
+WHERE "id" = $13`).
+		WithArgs("worker_0", "localhost", nil, true, nil, nil, `{"1"}`, nil, nil, nil, nil, nil, 1).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	_sqlite := testSqlite(t)

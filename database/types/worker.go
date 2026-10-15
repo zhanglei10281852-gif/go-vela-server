@@ -42,6 +42,7 @@ type Worker struct {
 	LastBuildFinishedAt sql.NullInt64  `sql:"last_build_finished_at"`
 	LastCheckedIn       sql.NullInt64  `sql:"last_checked_in"`
 	BuildLimit          sql.NullInt32  `sql:"build_limit"`
+	Generation          sql.NullString `sql:"generation"`
 }
 
 // Nullify ensures the valid flag for
@@ -99,6 +100,11 @@ func (w *Worker) Nullify() *Worker {
 		w.BuildLimit.Valid = false
 	}
 
+	// check if the Generation field should be false
+	if len(w.Generation.String) == 0 {
+		w.Generation.Valid = false
+	}
+
 	return w
 }
 
@@ -119,6 +125,12 @@ func (w *Worker) ToAPI(builds []*api.Build) *api.Worker {
 	worker.SetLastBuildFinishedAt(w.LastBuildFinishedAt.Int64)
 	worker.SetLastCheckedIn(w.LastCheckedIn.Int64)
 	worker.SetBuildLimit(w.BuildLimit.Int32)
+
+	// only set the generation when the record carries one;
+	// legacy rows (and the shared symmetric token mode) have none
+	if w.Generation.Valid {
+		worker.SetGeneration(w.Generation.String)
+	}
 
 	return worker
 }
@@ -186,6 +198,7 @@ func WorkerFromAPI(w *api.Worker) *Worker {
 		LastBuildFinishedAt: sql.NullInt64{Int64: w.GetLastBuildFinishedAt(), Valid: true},
 		LastCheckedIn:       sql.NullInt64{Int64: w.GetLastCheckedIn(), Valid: true},
 		BuildLimit:          sql.NullInt32{Int32: w.GetBuildLimit(), Valid: true},
+		Generation:          sql.NullString{String: w.GetGeneration(), Valid: true},
 	}
 
 	return worker.Nullify()

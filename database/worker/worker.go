@@ -4,8 +4,10 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -77,8 +79,66 @@ func New(opts ...EngineOpt) (*Engine, error) {
 		return nil, fmt.Errorf("unable to create indexes for %s table: %w", constants.TableWorker, err)
 	}
 
+	// ensure workers created before generations existed gain the generation column
+	err = e.ensureWorkerGeneration(e.ctx, e.client.Config.Dialector.Name())
+	if err != nil {
+		return nil, fmt.Errorf("unable to upgrade %s table: %w", constants.TableWorker, err)
+	}
+
+	// create the worker register tokens table
+	err = e.CreateWorkerRegisterTokenTable(e.ctx, e.client.Config.Dialector.Name())
+	if err != nil {
+		return nil, fmt.Errorf("unable to create %s table: %w", constants.TableWorkerRegisterToken, err)
+	}
+
+	// create the indexes for the worker register tokens table
+	err = e.CreateWorkerRegisterTokenIndexes(e.ctx)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create indexes for %s table: %w", constants.TableWorkerRegisterToken, err)
+	}
+
 	return e, nil
 }
+
+// ensureWorkerGeneration makes sure the generation column exists on a
+// workers table created by an older version of the server. Postgres
+// supports an idempotent ADD COLUMN statement; Sqlite does not, so a
+// duplicate-column error is expected and ignored on Sqlite.
+func (e *Engine) ensureWorkerGeneration(ctx context.Context, driver string) error {
+	e.logger.Tracef("ensuring workers table has generation column")
+
+	switch driver {
+	case constants.DriverPostgres:
+		return e.client.
+			WithContext(ctx).
+			Exec(AlterPostgresWorkerGeneration).Error
+	case constants.DriverSqlite:
+		fallthrough
+	default:
+		err := e.client.
+			WithContext(ctx).
+			Exec(AlterSqliteWorkerGeneration).Error
+		if err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			// the column already exists, nothing to upgrade
+			return nil
+		}
+
+		return err
+	}
+}
+
+// sentinel errors for worker lifecycle generation operations.
+var (
+	// ErrInvalidWorkerRegisterToken is returned when a register token
+	// cannot establish a worker generation because it is unknown,
+	// already used, expired, or scoped to a different hostname.
+	ErrInvalidWorkerRegisterToken = errors.New("invalid or consumed worker registration token")
+
+	// ErrStaleWorker is returned when a conditional worker write affects
+	// no rows because the worker was deleted and recreated as a newer
+	// generation after the request loaded its record.
+	ErrStaleWorker = errors.New("worker record is stale; the worker generation no longer exists")
+)
 
 // convertToBuilds is a helper function that generates build objects with ID fields given a list of IDs.
 func convertToBuilds(ids []string) []*api.Build {
