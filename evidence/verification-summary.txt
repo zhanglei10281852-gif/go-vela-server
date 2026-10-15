@@ -1,3 +1,3 @@
-读取 CompileAndPublish、PlanBuild、service/step 规划和数据库接口；目标包及重复执行专项测试通过。全量测试中的失败来自未改动的 scm/github CRLF 断言和 compiler/types/pipeline 既有规则断言。
+审阅构建发布、资源规划、服务步骤创建和数据库事务接口；目标包及重复执行专项测试通过。全量测试出现未改动模块的既有断言失败，属于换行符差异和流水线规则断言。
 
 Targeted tests: PASS. Full suite: failures are outside changed files and are existing LF/CRLF or pipeline-rule assertions.

@@ -1302,10 +1302,10 @@ index 00000000..6869b053
 +}
 diff --git a/evidence/model.patch b/evidence/model.patch
 new file mode 100644
-index 00000000..a4acc756
+index 00000000..ca8d9a0a
 --- /dev/null
 +++ b/evidence/model.patch
-@@ -0,0 +1,6294 @@
+@@ -0,0 +1,9978 @@
 +diff --git a/api/build/compile_publish.go b/api/build/compile_publish.go
 +index af981074..a878df3e 100644
 +--- a/api/build/compile_publish.go
@@ -2610,10 +2610,10 @@ index 00000000..a4acc756
 ++}
 +diff --git a/evidence/model.patch b/evidence/model.patch
 +new file mode 100644
-+index 00000000..16743be4
++index 00000000..a4acc756
 +--- /dev/null
 ++++ b/evidence/model.patch
-+@@ -0,0 +1,2610 @@
++@@ -0,0 +1,6294 @@
 ++diff --git a/api/build/compile_publish.go b/api/build/compile_publish.go
 ++index af981074..a878df3e 100644
 ++--- a/api/build/compile_publish.go
@@ -3918,10 +3918,10 @@ index 00000000..a4acc756
 +++}
 ++diff --git a/evidence/model.patch b/evidence/model.patch
 ++new file mode 100644
-++index 00000000..3acbc007
+++index 00000000..16743be4
 ++--- /dev/null
 +++++ b/evidence/model.patch
-++@@ -0,0 +1,1302 @@
+++@@ -0,0 +1,2610 @@
 +++diff --git a/api/build/compile_publish.go b/api/build/compile_publish.go
 +++index af981074..a878df3e 100644
 +++--- a/api/build/compile_publish.go
@@ -5224,6 +5224,3690 @@ index 00000000..a4acc756
 ++++		t.Errorf("CountBuilds after rollback = %d, want 0", count)
 ++++	}
 ++++}
++++diff --git a/evidence/model.patch b/evidence/model.patch
++++new file mode 100644
++++index 00000000..3acbc007
++++--- /dev/null
+++++++ b/evidence/model.patch
++++@@ -0,0 +1,1302 @@
+++++diff --git a/api/build/compile_publish.go b/api/build/compile_publish.go
+++++index af981074..a878df3e 100644
+++++--- a/api/build/compile_publish.go
++++++++ b/api/build/compile_publish.go
+++++@@ -390,14 +390,21 @@ func CompileAndPublish(
+++++ 
+++++ 		b.SetPipelineID(pipeline.GetID())
+++++ 
+++++-		// create the objects from the pipeline in the database
+++++-		// TODO:
+++++-		// - if a build gets created and something else fails midway,
+++++-		//   the next loop will attempt to create the same build,
+++++-		//   using the same Number and thus create a constraint
+++++-		//   conflict; consider deleting the partially created
+++++-		//   build object in the database
+++++-		b, err = PlanBuild(ctx, database, scm, p, b, r)
++++++		// determine the queue route before persisting any build resources so a
++++++		// routing validation failure leaves no build or child resources behind
++++++		route, routeErr := queue.Route(&p.Worker)
++++++		if routeErr != nil {
++++++			retErr := fmt.Errorf("unable to set route for %s: %w", r.GetFullName(), routeErr)
++++++
++++++			return nil, nil, http.StatusBadRequest, retErr
++++++		}
++++++
++++++		b.SetRoute(route)
++++++
++++++		// atomically create the build, all services, all steps, their logs, and
++++++		// the build executable. On failure nothing is committed, so the next
++++++		// attempt cannot conflict with a build number or duplicate children.
++++++		b, err = PlanBuild(ctx, database, cache, scm, p, b, r)
+++++ 		if err != nil {
+++++ 			retErr := fmt.Errorf("%s: %w", baseErr, err)
+++++ 
+++++@@ -405,7 +412,11 @@ func CompileAndPublish(
+++++ 			if i < cfg.Retries-1 {
+++++ 				logger.WithError(retErr).Warningf("retrying #%d", i+1)
+++++ 
+++++-				// reset fields set by cleanBuild for retry
++++++				// reset build fields for a fresh planning attempt; the failed
++++++				// attempt left no committed build, so clear any identifiers it
++++++				// assigned in memory before retrying
++++++				b.SetID(0)
++++++				b.SetNumber(0)
+++++ 				b.SetError("")
+++++ 				b.SetStatus(constants.StatusPending)
+++++ 				b.SetFinished(0)
+++++@@ -448,47 +459,9 @@ func CompileAndPublish(
+++++ 		return nil, nil, http.StatusInternalServerError, retErr
+++++ 	}
+++++ 
+++++-	var (
+++++-		scmRepos []string
+++++-		scmPerms map[string]string
+++++-	)
+++++-
+++++-	if p.Git != nil {
+++++-		scmRepos = p.Git.Token.Repositories
+++++-		scmPerms = p.Git.Token.Permissions
+++++-	}
+++++-
+++++-	scmBuildToken, scmBuildTokenExp, err := scm.GetNetrcPassword(ctx, database, cache, b, scmRepos, scmPerms)
+++++-	if err != nil {
+++++-		retErr := fmt.Errorf("%s: failed to get SCM build token for %s: %w", baseErr, r.GetFullName(), err)
+++++-
+++++-		return nil, nil, http.StatusInternalServerError, retErr
+++++-	}
+++++-
+++++-	p.Token = scmBuildToken
+++++-	p.TokenExp = scmBuildTokenExp
+++++-
+++++-	// determine queue route
+++++-	route, err := queue.Route(&p.Worker)
+++++-	if err != nil {
+++++-		retErr := fmt.Errorf("unable to set route for build %d for %s: %w", b.GetNumber(), r.GetFullName(), err)
+++++-
+++++-		// error out the build
+++++-		CleanBuild(ctx, database, b, nil, nil, retErr)
+++++-
+++++-		return nil, nil, http.StatusBadRequest, retErr
+++++-	}
+++++-
+++++-	b.SetRoute(route)
+++++-
+++++-	// publish the pipeline.Build to the build_executables table to be requested by a worker
+++++-	err = PublishBuildExecutable(ctx, database, p, b)
+++++-	if err != nil {
+++++-		retErr := fmt.Errorf("unable to publish build executable for %s/%d: %w", r.GetFullName(), b.GetNumber(), err)
+++++-
+++++-		return nil, nil, http.StatusInternalServerError, retErr
+++++-	}
+++++-
++++++	// the build, services, steps, logs, and build executable were committed
++++++	// together by PlanBuild, so the queue item now points at a fully
++++++	// consumable build
+++++ 	return p, models.ToItem(b), http.StatusCreated, nil
+++++ }
+++++ 
+++++diff --git a/api/build/executable.go b/api/build/executable.go
+++++index 86670868..2b818ccc 100644
+++++--- a/api/build/executable.go
++++++++ b/api/build/executable.go
+++++@@ -3,16 +3,12 @@
+++++ package build
+++++ 
+++++ import (
+++++-	"context"
+++++-	"encoding/json"
+++++ 	"fmt"
+++++ 	"net/http"
+++++ 
+++++ 	"github.com/gin-gonic/gin"
+++++ 	"github.com/sirupsen/logrus"
+++++ 
+++++-	"github.com/go-vela/server/api/types"
+++++-	"github.com/go-vela/server/compiler/types/pipeline"
+++++ 	"github.com/go-vela/server/database"
+++++ 	"github.com/go-vela/server/router/middleware/build"
+++++ 	"github.com/go-vela/server/router/middleware/repo"
+++++@@ -89,40 +85,3 @@ func GetBuildExecutable(c *gin.Context) {
+++++ 
+++++ 	c.JSON(http.StatusOK, bExecutable)
+++++ }
+++++-
+++++-// PublishBuildExecutable marshals a pipeline.Build into bytes and pushes that data to the build_executables table to be
+++++-// requested by a worker whenever the build has been picked up.
+++++-func PublishBuildExecutable(ctx context.Context, db database.Interface, p *pipeline.Build, b *types.Build) error {
+++++-	// marshal pipeline build into byte data to add to the build executable object
+++++-	byteExecutable, err := json.Marshal(p)
+++++-	if err != nil {
+++++-		logrus.Errorf("failed to marshal build executable: %v", err)
+++++-
+++++-		// error out the build
+++++-		CleanBuild(ctx, db, b, nil, nil, err)
+++++-
+++++-		return err
+++++-	}
+++++-
+++++-	// create build executable to push to database
+++++-	bExecutable := new(types.BuildExecutable)
+++++-	bExecutable.SetBuildID(b.GetID())
+++++-	bExecutable.SetData(byteExecutable)
+++++-
+++++-	// send database call to create a build executable
+++++-	err = db.CreateBuildExecutable(ctx, bExecutable)
+++++-	if err != nil {
+++++-		logrus.Errorf("failed to publish build executable to database: %v", err)
+++++-
+++++-		// error out the build
+++++-		CleanBuild(ctx, db, b, nil, nil, err)
+++++-
+++++-		return err
+++++-	}
+++++-
+++++-	logrus.WithFields(logrus.Fields{
+++++-		"build_executable_id": bExecutable.GetBuildID(),
+++++-	}).Info("created build executable")
+++++-
+++++-	return nil
+++++-}
+++++diff --git a/api/build/plan.go b/api/build/plan.go
+++++index 544cd1cd..d1885980 100644
+++++--- a/api/build/plan.go
++++++++ b/api/build/plan.go
+++++@@ -4,6 +4,7 @@ package build
+++++ 
+++++ import (
+++++ 	"context"
++++++	"encoding/json"
+++++ 	"fmt"
+++++ 	"time"
+++++ 
+++++@@ -12,57 +13,106 @@ import (
+++++ 	"github.com/go-vela/server/api/service"
+++++ 	"github.com/go-vela/server/api/step"
+++++ 	"github.com/go-vela/server/api/types"
++++++	"github.com/go-vela/server/cache"
+++++ 	"github.com/go-vela/server/compiler/types/pipeline"
+++++ 	"github.com/go-vela/server/database"
+++++ 	"github.com/go-vela/server/scm"
+++++ )
+++++ 
+++++ // PlanBuild is a helper function to plan the build for
+++++-// execution. This creates all resources, like steps
+++++-// and services, for the build.
+++++-// TODO:
+++++-// - return build and error.
+++++-func PlanBuild(ctx context.Context, database database.Interface, scm scm.Service, p *pipeline.Build, b *types.Build, r *types.Repo) (*types.Build, error) {
++++++// execution. It constructs all resources for the build -
++++++// the build itself, all services, all steps, the log
++++++// placeholders, and the build executable - and persists
++++++// them as a single atomic unit.
++++++//
++++++// Either every resource commits together and the build is immediately
++++++// consumable, or no resource is created and the next attempt starts without a
++++++// conflicting build number or any orphaned child resources. All recovery is
++++++// driven by the single database transaction's committed state, never by an
++++++// in-process list of objects that may have been created before a failure.
++++++func PlanBuild(ctx context.Context, db database.Interface, tknCache cache.Service, scm scm.Service, p *pipeline.Build, b *types.Build, r *types.Repo) (*types.Build, error) {
+++++ 	// update fields in build object
+++++ 	b.SetCreated(time.Now().UTC().Unix())
+++++ 
+++++-	// send API call to create the build
+++++-	b, err := database.CreateBuild(ctx, b)
++++++	// construct all child resources in memory; nothing is persisted yet
++++++	services, err := service.PlanServices(p, b)
+++++ 	if err != nil {
+++++-		// clean up the objects from the pipeline in the database
+++++-		// TODO:
+++++-		// - even if it was created, we need to get the new build id
+++++-		//   otherwise it will be 0, which attempts to INSERT instead
+++++-		//   of UPDATE-ing the existing build - which results in
+++++-		//   a constraint error (repo_id, number)
+++++-		// - do we want to update the build or just delete it?
+++++-		CleanBuild(ctx, database, b, nil, nil, err)
++++++		return nil, err
++++++	}
++++++
++++++	steps, err := step.PlanSteps(p, b)
++++++	if err != nil {
++++++		return nil, err
++++++	}
++++++
++++++	var (
++++++		scmRepos []string
++++++		scmPerms map[string]string
++++++	)
++++++
++++++	if p.Git != nil {
++++++		scmRepos = p.Git.Token.Repositories
++++++		scmPerms = p.Git.Token.Permissions
++++++	}
++++++
++++++	// finalize runs inside the planning transaction after the build row has
++++++	// been inserted, so the build has its final ID used to scope the SCM
++++++	// token. It returns the marshaled executable that gets inserted in the
++++++	// same transaction. Returning an error rolls back the entire build plan.
++++++	finalize := func(b *types.Build, _ []*types.Service, _ []*types.Step) ([]byte, error) {
++++++		scmBuildToken, scmBuildTokenExp, err := scm.GetNetrcPassword(ctx, db, tknCache, b, scmRepos, scmPerms)
++++++		if err != nil {
++++++			return nil, fmt.Errorf("failed to get SCM build token for %s: %w", r.GetFullName(), err)
++++++		}
++++++
++++++		p.Token = scmBuildToken
++++++		p.TokenExp = scmBuildTokenExp
++++++
++++++		// marshal pipeline build into byte data to add to the build executable object
++++++		byteExecutable, err := json.Marshal(p)
++++++		if err != nil {
++++++			return nil, fmt.Errorf("failed to marshal build executable for %s: %w", r.GetFullName(), err)
++++++		}
+++++ 
++++++		return byteExecutable, nil
++++++	}
++++++
++++++	// atomically create the build, services, steps, logs, and executable
++++++	result, err := db.PlanBuild(ctx, b, services, steps, finalize)
++++++	if err != nil {
+++++ 		return nil, fmt.Errorf("unable to create new build for %s: %w", r.GetFullName(), err)
+++++ 	}
+++++ 
++++++	b = result.Build
++++++
+++++ 	logrus.WithFields(logrus.Fields{
+++++ 		"build":    b.GetNumber(),
+++++ 		"build_id": b.GetID(),
+++++ 	}).Info("build created")
+++++ 
+++++-	// plan all services for the build
+++++-	services, err := service.PlanServices(ctx, database, p, b)
+++++-	if err != nil {
+++++-		// clean up the objects from the pipeline in the database
+++++-		CleanBuild(ctx, database, b, services, nil, err)
+++++-
+++++-		return nil, err
++++++	for _, s := range result.Services {
++++++		logrus.WithFields(logrus.Fields{
++++++			"service":    s.GetName(),
++++++			"service_id": s.GetID(),
++++++			"org":        b.GetRepo().GetOrg(),
++++++			"repo":       b.GetRepo().GetName(),
++++++			"repo_id":    b.GetRepo().GetID(),
++++++		}).Info("service created")
+++++ 	}
+++++ 
+++++-	// plan all steps for the build
+++++-	steps, err := step.PlanSteps(ctx, database, scm, p, b)
+++++-	if err != nil {
+++++-		// clean up the objects from the pipeline in the database
+++++-		CleanBuild(ctx, database, b, services, steps, err)
+++++-
+++++-		return nil, err
++++++	for _, s := range result.Steps {
++++++		logrus.WithFields(logrus.Fields{
++++++			"step":    s.GetName(),
++++++			"step_id": s.GetID(),
++++++			"org":     b.GetRepo().GetOrg(),
++++++			"repo":    b.GetRepo().GetName(),
++++++			"repo_id": b.GetRepo().GetID(),
++++++		}).Info("step created")
+++++ 	}
+++++ 
++++++	// the commit status updates are external side effects that cannot be
++++++	// rolled back, so they are only sent once the full plan is committed
++++++	step.ReportStepStatuses(ctx, scm, p, b, result.Steps)
++++++
+++++ 	return b, nil
+++++ }
+++++diff --git a/api/service/plan.go b/api/service/plan.go
+++++index 040a421f..33a750d5 100644
+++++--- a/api/service/plan.go
++++++++ b/api/service/plan.go
+++++@@ -3,24 +3,25 @@
+++++ package service
+++++ 
+++++ import (
+++++-	"context"
+++++-	"fmt"
+++++ 	"time"
+++++ 
+++++-	"github.com/sirupsen/logrus"
+++++-
+++++ 	"github.com/go-vela/server/api/types"
+++++ 	"github.com/go-vela/server/compiler/types/pipeline"
+++++ 	"github.com/go-vela/server/constants"
+++++-	"github.com/go-vela/server/database"
+++++ )
+++++ 
+++++ // PlanServices is a helper function to plan all services
+++++-// in the build for execution. This creates the services
+++++-// for the build.
+++++-func PlanServices(ctx context.Context, database database.Interface, p *pipeline.Build, b *types.Build) ([]*types.Service, error) {
++++++// in the build for execution. This constructs the service
++++++// resources for the build from the pipeline and merges the
++++++// service environment variables into the pipeline.
++++++//
++++++// No database resources are created here. The returned services are
++++++// persisted atomically, together with the build, its steps, logs, and build
++++++// executable, by PlanBuild so that a failure while planning can never leave
++++++// a partial set of services behind.
++++++func PlanServices(p *pipeline.Build, b *types.Build) ([]*types.Service, error) {
+++++ 	// variable to store planned services
+++++-	services := []*types.Service{}
++++++	services := make([]*types.Service, 0, len(p.Services))
+++++ 
+++++ 	// iterate through all pipeline services
+++++ 	for _, service := range p.Services {
+++++@@ -34,47 +35,12 @@ func PlanServices(ctx context.Context, database database.Interface, p *pipeline.
+++++ 		s.SetStatus(constants.StatusPending)
+++++ 		s.SetCreated(time.Now().UTC().Unix())
+++++ 
+++++-		// send API call to create the service
+++++-		s, err := database.CreateService(ctx, s)
+++++-		if err != nil {
+++++-			return services, fmt.Errorf("unable to create service %s: %w", s.GetName(), err)
+++++-		}
+++++-
+++++-		logrus.WithFields(logrus.Fields{
+++++-			"service":    s.GetName(),
+++++-			"service_id": s.GetID(),
+++++-			"org":        b.GetRepo().GetOrg(),
+++++-			"repo":       b.GetRepo().GetName(),
+++++-			"repo_id":    b.GetRepo().GetID(),
+++++-		}).Info("service created")
+++++-
+++++-		err = service.MergeEnv(s.Environment())
+++++-		if err != nil {
+++++-			return services, err
+++++-		}
+++++-
+++++-		// create the log object
+++++-		l := new(types.Log)
+++++-		l.SetServiceID(s.GetID())
+++++-		l.SetBuildID(b.GetID())
+++++-		l.SetRepoID(b.GetRepo().GetID())
+++++-		l.SetData([]byte{})
+++++-		l.SetCreatedAt(time.Now().UTC().Unix())
+++++-
+++++-		// send API call to create the service logs
+++++-		err = database.CreateLog(ctx, l)
++++++		err := service.MergeEnv(s.Environment())
+++++ 		if err != nil {
+++++-			return services, fmt.Errorf("unable to create service logs for service %s: %w", s.GetName(), err)
++++++			return nil, err
+++++ 		}
+++++ 
+++++-		logrus.WithFields(logrus.Fields{
+++++-			"service":    s.GetName(),
+++++-			"service_id": s.GetID(),
+++++-			"log_id":     l.GetID(), // it won't have an ID here, because CreateLog doesn't return the created log
+++++-			"org":        b.GetRepo().GetOrg(),
+++++-			"repo":       b.GetRepo().GetName(),
+++++-			"repo_id":    b.GetRepo().GetID(),
+++++-		}).Info("log for service created")
++++++		services = append(services, s)
+++++ 	}
+++++ 
+++++ 	return services, nil
+++++diff --git a/api/step/plan.go b/api/step/plan.go
+++++index 6f1864b7..4bbafd8e 100644
+++++--- a/api/step/plan.go
++++++++ b/api/step/plan.go
+++++@@ -4,7 +4,6 @@ package step
+++++ 
+++++ import (
+++++ 	"context"
+++++-	"fmt"
+++++ 	"time"
+++++ 
+++++ 	"github.com/sirupsen/logrus"
+++++@@ -12,25 +11,29 @@ import (
+++++ 	"github.com/go-vela/server/api/types"
+++++ 	"github.com/go-vela/server/compiler/types/pipeline"
+++++ 	"github.com/go-vela/server/constants"
+++++-	"github.com/go-vela/server/database"
+++++ 	"github.com/go-vela/server/scm"
+++++ )
+++++ 
+++++ // PlanSteps is a helper function to plan all steps
+++++-// in the build for execution. This creates the steps
+++++-// for the build.
+++++-func PlanSteps(ctx context.Context, database database.Interface, scm scm.Service, p *pipeline.Build, b *types.Build) ([]*types.Step, error) {
++++++// in the build for execution. This constructs the step
++++++// resources for the build from the pipeline and merges
++++++// the step environment variables into the pipeline.
++++++//
++++++// No database resources are created here. The returned steps are persisted
++++++// atomically, together with the build, its services, logs, and build
++++++// executable, by PlanBuild so that a failure while planning can never leave a
++++++// partial set of steps behind.
++++++func PlanSteps(p *pipeline.Build, b *types.Build) ([]*types.Step, error) {
+++++ 	// variable to store planned steps
+++++ 	steps := []*types.Step{}
+++++ 
+++++ 	// iterate through all pipeline stages
+++++ 	for _, stage := range p.Stages {
+++++ 		// iterate through all steps for each pipeline stage
+++++-		for _, step := range stage.Steps {
+++++-			// create the step object
+++++-			s, err := planStep(ctx, database, scm, b, step, stage.Name)
++++++		for _, c := range stage.Steps {
++++++			s, err := planStep(b, c, stage.Name)
+++++ 			if err != nil {
+++++-				return steps, err
++++++				return nil, err
+++++ 			}
+++++ 
+++++ 			steps = append(steps, s)
+++++@@ -38,10 +41,10 @@ func PlanSteps(ctx context.Context, database database.Interface, scm scm.Service
+++++ 	}
+++++ 
+++++ 	// iterate through all pipeline steps
+++++-	for _, step := range p.Steps {
+++++-		s, err := planStep(ctx, database, scm, b, step, "")
++++++	for _, c := range p.Steps {
++++++		s, err := planStep(b, c, "")
+++++ 		if err != nil {
+++++-			return steps, err
++++++			return nil, err
+++++ 		}
+++++ 
+++++ 		steps = append(steps, s)
+++++@@ -50,7 +53,7 @@ func PlanSteps(ctx context.Context, database database.Interface, scm scm.Service
+++++ 	return steps, nil
+++++ }
+++++ 
+++++-func planStep(ctx context.Context, database database.Interface, scm scm.Service, b *types.Build, c *pipeline.Container, stage string) (*types.Step, error) {
++++++func planStep(b *types.Build, c *pipeline.Container, stage string) (*types.Step, error) {
+++++ 	// create the step object
+++++ 	s := new(types.Step)
+++++ 	s.SetBuildID(b.GetID())
+++++@@ -63,56 +66,52 @@ func planStep(ctx context.Context, database database.Interface, scm scm.Service,
+++++ 	s.SetReportAs(c.ReportAs)
+++++ 	s.SetCreated(time.Now().UTC().Unix())
+++++ 
+++++-	// send API call to create the step
+++++-	s, err := database.CreateStep(ctx, s)
++++++	// populate environment variables from step
++++++	err := c.MergeEnv(s.Environment())
+++++ 	if err != nil {
+++++-		return nil, fmt.Errorf("unable to create step %s: %w", s.GetName(), err)
++++++		return nil, err
+++++ 	}
+++++ 
+++++-	logrus.WithFields(logrus.Fields{
+++++-		"step":    s.GetName(),
+++++-		"step_id": s.GetID(),
+++++-		"org":     b.GetRepo().GetOrg(),
+++++-		"repo":    b.GetRepo().GetName(),
+++++-		"repo_id": b.GetRepo().GetID(),
+++++-	}).Info("step created")
++++++	return s, nil
++++++}
+++++ 
+++++-	// populate environment variables from step
+++++-	err = c.MergeEnv(s.Environment())
+++++-	if err != nil {
+++++-		return nil, err
++++++// ReportStepStatuses sends commit statuses for the steps in the build that
++++++// were configured with report_as. This is performed after the planning
++++++// transaction has committed because the status update is an external side
++++++// effect that cannot be rolled back; failures are logged but do not fail the
++++++// build, matching the previous behavior.
++++++func ReportStepStatuses(ctx context.Context, client scm.Service, p *pipeline.Build, b *types.Build, steps []*types.Step) {
++++++	// index the created steps by number so the pipeline containers can be
++++++	// matched to the persisted steps carrying their final IDs
++++++	byNumber := make(map[int32]*types.Step, len(steps))
++++++
++++++	for _, s := range steps {
++++++		byNumber[s.GetNumber()] = s
+++++ 	}
+++++ 
+++++-	// create the log object
+++++-	l := new(types.Log)
+++++-	l.SetStepID(s.GetID())
+++++-	l.SetBuildID(b.GetID())
+++++-	l.SetRepoID(b.GetRepo().GetID())
+++++-	l.SetData([]byte{})
+++++-	l.SetCreatedAt(time.Now().UTC().Unix())
++++++	// collect the pipeline containers in the same order that PlanSteps does
++++++	containers := make([]*pipeline.Container, 0, len(steps))
+++++ 
+++++-	// send API call to create the step logs
+++++-	err = database.CreateLog(ctx, l)
+++++-	if err != nil {
+++++-		return nil, fmt.Errorf("unable to create logs for step %s: %w", s.GetName(), err)
++++++	for _, stage := range p.Stages {
++++++		containers = append(containers, stage.Steps...)
+++++ 	}
+++++ 
+++++-	logrus.WithFields(logrus.Fields{
+++++-		"step":    s.GetName(),
+++++-		"step_id": s.GetID(),
+++++-		"log_id":  l.GetID(), // it won't have an ID here
+++++-		"org":     b.GetRepo().GetOrg(),
+++++-		"repo":    b.GetRepo().GetName(),
+++++-		"repo_id": b.GetRepo().GetID(),
+++++-	}).Info("log for step created")
++++++	containers = append(containers, p.Steps...)
++++++
++++++	for _, c := range containers {
++++++		if len(c.ReportAs) == 0 {
++++++			continue
++++++		}
++++++
++++++		s, ok := byNumber[c.Number]
++++++		if !ok {
++++++			continue
++++++		}
+++++ 
+++++-	if len(s.GetReportAs()) > 0 {
+++++ 		// send API call to set the status on the commit using token in environment
+++++-		err := scm.StepStatus(ctx, b, s, c.Environment["VELA_NETRC_PASSWORD"])
++++++		err := client.StepStatus(ctx, b, s, c.Environment["VELA_NETRC_PASSWORD"])
+++++ 		if err != nil {
+++++ 			logrus.Errorf("unable to set commit status for build: %v", err)
+++++ 		}
+++++ 	}
+++++-
+++++-	return s, nil
+++++ }
+++++diff --git a/database/interface.go b/database/interface.go
+++++index e2a6343c..dde87a52 100644
+++++--- a/database/interface.go
++++++++ b/database/interface.go
+++++@@ -3,6 +3,9 @@
+++++ package database
+++++ 
+++++ import (
++++++	"context"
++++++
++++++	api "github.com/go-vela/server/api/types"
+++++ 	"github.com/go-vela/server/database/build"
+++++ 	"github.com/go-vela/server/database/dashboard"
+++++ 	"github.com/go-vela/server/database/deployment"
+++++@@ -39,6 +42,12 @@ type Interface interface {
+++++ 
+++++ 	// Resource Interface Functions
+++++ 
++++++	// PlanBuild defines a function that atomically creates a build together
++++++	// with all of its services, steps, logs, and build executable inside a
++++++	// single transaction. Either every resource is committed together or none
++++++	// of them are created.
++++++	PlanBuild(context.Context, *api.Build, []*api.Service, []*api.Step, FinalizeBuildExecutable) (*PlanBuildResult, error)
++++++
+++++ 	// SettingsInterface defines the interface for platform settings stored in the database.
+++++ 	settings.SettingsInterface
+++++ 
+++++diff --git a/database/plan.go b/database/plan.go
+++++new file mode 100644
+++++index 00000000..bc3188f1
+++++--- /dev/null
++++++++ b/database/plan.go
+++++@@ -0,0 +1,257 @@
++++++// SPDX-License-Identifier: Apache-2.0
++++++
++++++package database
++++++
++++++import (
++++++	"context"
++++++	"fmt"
++++++	"time"
++++++
++++++	"github.com/sirupsen/logrus"
++++++	"gorm.io/gorm"
++++++
++++++	api "github.com/go-vela/server/api/types"
++++++	"github.com/go-vela/server/constants"
++++++	dbtypes "github.com/go-vela/server/database/types"
++++++)
++++++
++++++// FinalizeBuildExecutable defines a function that is invoked within the
++++++// planning transaction after the build, services, and steps have been inserted.
++++++//
++++++// The build passed to the function carries its final ID and number, so the
++++++// returned marshaled executable data may include build-scoped values such as
++++++// the SCM build token. Returning an error rolls back the entire planning
++++++// transaction, leaving no build or child resources behind.
++++++type FinalizeBuildExecutable func(b *api.Build, services []*api.Service, steps []*api.Step) ([]byte, error)
++++++
++++++// PlanBuildResult is the set of resources created by a successful
++++++// PlanBuild transaction.
++++++type PlanBuildResult struct {
++++++	// Build is the newly created build, populated with its ID and number.
++++++	Build *api.Build
++++++	// Services is the complete, ordered set of services created for the build.
++++++	Services []*api.Service
++++++	// Steps is the complete, ordered set of steps created for the build.
++++++	Steps []*api.Step
++++++}
++++++
++++++// PlanBuild atomically persists the complete set of resources required for a
++++++// build to be consumable: the build itself, every service, every step, the
++++++// empty log placeholder for each service and step, and the build executable.
++++++//
++++++// All of the inserts run inside a single database transaction. If any insert
++++++// fails, or if the finalizeExecutable callback returns an error, the
++++++// transaction is rolled back: the repo counter is not incremented and no
++++++// build, service, step, log, or executable rows are left behind. This
++++++// guarantees that a retry starts from a clean persisted state, can never
++++++// conflict with a build number from a failed attempt, and can never produce a
++++++// second set of child resources for the same build.
++++++//
++++++// Recovery after a crash or partial failure is therefore driven entirely by
++++++// the database transaction state - either every row for the build exists or
++++++// none do - instead of any in-process list of the objects that were created.
++++++func (e *engine) PlanBuild(ctx context.Context, b *api.Build, services []*api.Service, steps []*api.Step, finalizeExecutable FinalizeBuildExecutable) (*PlanBuildResult, error) {
++++++	logger := e.logger.WithFields(logrus.Fields{
++++++		"org":     b.GetRepo().GetOrg(),
++++++		"repo":    b.GetRepo().GetName(),
++++++		"repo_id": b.GetRepo().GetID(),
++++++	})
++++++
++++++	logger.Trace("planning build")
++++++
++++++	var (
++++++		buildID int64
++++++		number  int64
++++++		result  = new(PlanBuildResult)
++++++	)
++++++
++++++	err := e.client.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
++++++		r := b.GetRepo()
++++++
++++++		if r.GetID() == 0 {
++++++			return fmt.Errorf("repo ID must be set")
++++++		}
++++++
++++++		// assign the next build number by incrementing the counter for the repo
++++++		err := tx.Raw("UPDATE repos SET counter = counter + 1 WHERE id = ? RETURNING counter", r.GetID()).Scan(&number).Error
++++++		if err != nil {
++++++			return err
++++++		}
++++++
++++++		b.SetNumber(number)
++++++
++++++		// insert the build
++++++		dbBuild := dbtypes.BuildFromAPI(b)
++++++
++++++		err = dbBuild.Validate()
++++++		if err != nil {
++++++			return err
++++++		}
++++++
++++++		dbBuild = dbBuild.Crop()
++++++
++++++		err = tx.Table(constants.TableBuild).Create(dbBuild).Error
++++++		if err != nil {
++++++			return err
++++++		}
++++++
++++++		buildID = dbBuild.ID.Int64
++++++
++++++		b.SetID(buildID)
++++++
++++++		// insert every service with its empty log placeholder
++++++		plannedServices := make([]*api.Service, 0, len(services))
++++++
++++++		for _, s := range services {
++++++			s.SetBuildID(buildID)
++++++			s.SetRepoID(r.GetID())
++++++
++++++			dbService := dbtypes.ServiceFromAPI(s)
++++++
++++++			err = dbService.Validate()
++++++			if err != nil {
++++++				return fmt.Errorf("unable to create service %s: %w", s.GetName(), err)
++++++			}
++++++
++++++			err = tx.Table(constants.TableService).Create(dbService).Error
++++++			if err != nil {
++++++				return fmt.Errorf("unable to create service %s: %w", s.GetName(), err)
++++++			}
++++++
++++++			s.SetID(dbService.ID.Int64)
++++++
++++++			err = createPlanLog(tx, e.config.CompressionLevel, s.GetID(), 0, buildID, r.GetID())
++++++			if err != nil {
++++++				return fmt.Errorf("unable to create service logs for service %s: %w", s.GetName(), err)
++++++			}
++++++
++++++			plannedServices = append(plannedServices, s)
++++++		}
++++++
++++++		// insert every step with its empty log placeholder
++++++		plannedSteps := make([]*api.Step, 0, len(steps))
++++++
++++++		for _, s := range steps {
++++++			s.SetBuildID(buildID)
++++++			s.SetRepoID(r.GetID())
++++++
++++++			dbStep := dbtypes.StepFromAPI(s)
++++++
++++++			err = dbStep.Validate()
++++++			if err != nil {
++++++				return fmt.Errorf("unable to create step %s: %w", s.GetName(), err)
++++++			}
++++++
++++++			err = tx.Table(constants.TableStep).Create(dbStep).Error
++++++			if err != nil {
++++++				return fmt.Errorf("unable to create step %s: %w", s.GetName(), err)
++++++			}
++++++
++++++			s.SetID(dbStep.ID.Int64)
++++++
++++++			err = createPlanLog(tx, e.config.CompressionLevel, 0, s.GetID(), buildID, r.GetID())
++++++			if err != nil {
++++++				return fmt.Errorf("unable to create logs for step %s: %w", s.GetName(), err)
++++++			}
++++++
++++++			plannedSteps = append(plannedSteps, s)
++++++		}
++++++
++++++		// build and insert the executable while the transaction is open so
++++++		// the build only becomes consumable if the executable exists as well
++++++		executableData, err := finalizeExecutable(b, plannedServices, plannedSteps)
++++++		if err != nil {
++++++			return err
++++++		}
++++++
++++++		dbExecutable := new(api.BuildExecutable)
++++++		dbExecutable.SetBuildID(buildID)
++++++		dbExecutable.SetData(executableData)
++++++
++++++		executable := dbtypes.BuildExecutableFromAPI(dbExecutable)
++++++
++++++		err = executable.Validate()
++++++		if err != nil {
++++++			return err
++++++		}
++++++
++++++		err = executable.Compress(e.config.CompressionLevel)
++++++		if err != nil {
++++++			return err
++++++		}
++++++
++++++		err = executable.Encrypt(e.config.EncryptionKey)
++++++		if err != nil {
++++++			return fmt.Errorf("unable to encrypt build executable for build %d: %w", buildID, err)
++++++		}
++++++
++++++		err = tx.Table(constants.TableBuildExecutable).Create(executable).Error
++++++		if err != nil {
++++++			return fmt.Errorf("unable to create build executable: %w", err)
++++++		}
++++++
++++++		result.Build = b
++++++		result.Services = plannedServices
++++++		result.Steps = plannedSteps
++++++
++++++		return nil
++++++	})
++++++	if err != nil {
++++++		// the transaction was rolled back so nothing was persisted. Reset the
++++++		// identifiers that were assigned during planning to ensure the caller
++++++		// does not carry a stale build number or child build IDs into a retry.
++++++		b.SetID(0)
++++++		b.SetNumber(0)
++++++
++++++		for _, s := range services {
++++++			s.SetID(0)
++++++			s.SetBuildID(0)
++++++		}
++++++
++++++		for _, s := range steps {
++++++			s.SetID(0)
++++++			s.SetBuildID(0)
++++++		}
++++++
++++++		return nil, err
++++++	}
++++++
++++++	// keep the in-memory repo counter consistent with the database
++++++	b.GetRepo().SetCounter(number)
++++++
++++++	logger.WithFields(logrus.Fields{
++++++		"build":    number,
++++++		"build_id": buildID,
++++++		"services": len(result.Services),
++++++		"steps":    len(result.Steps),
++++++	}).Info("build planned")
++++++
++++++	return result, nil
++++++}
++++++
++++++// createPlanLog inserts an empty log placeholder for a newly created service
++++++// or step using the provided transaction. Exactly one of serviceID or stepID
++++++// must be set.
++++++func createPlanLog(tx *gorm.DB, compressionLevel int, serviceID, stepID, buildID, repoID int64) error {
++++++	l := new(api.Log)
++++++	l.SetServiceID(serviceID)
++++++	l.SetStepID(stepID)
++++++	l.SetBuildID(buildID)
++++++	l.SetRepoID(repoID)
++++++	l.SetData([]byte{})
++++++	l.SetCreatedAt(time.Now().UTC().Unix())
++++++
++++++	dbLog := dbtypes.LogFromAPI(l)
++++++
++++++	err := dbLog.Validate()
++++++	if err != nil {
++++++		return err
++++++	}
++++++
++++++	err = dbLog.Compress(compressionLevel)
++++++	if err != nil {
++++++		return err
++++++	}
++++++
++++++	return tx.Table(constants.TableLog).Create(dbLog).Error
++++++}
+++++diff --git a/database/plan_test.go b/database/plan_test.go
+++++new file mode 100644
+++++index 00000000..6869b053
+++++--- /dev/null
++++++++ b/database/plan_test.go
+++++@@ -0,0 +1,445 @@
++++++// SPDX-License-Identifier: Apache-2.0
++++++
++++++package database
++++++
++++++import (
++++++	"context"
++++++	"errors"
++++++	"fmt"
++++++	"testing"
++++++	"time"
++++++
++++++	api "github.com/go-vela/server/api/types"
++++++	"github.com/go-vela/server/constants"
++++++	"github.com/go-vela/server/tracing"
++++++)
++++++
++++++// testPlanEngine creates an isolated in-memory sqlite engine for planning tests.
++++++func testPlanEngine(t *testing.T) Interface {
++++++	t.Helper()
++++++
++++++	// use a unique named in-memory database per test so shared-cache databases
++++++	// do not leak state between tests
++++++	name := sanitizeDSNName(t.Name())
++++++
++++++	db, err := New(
++++++		WithAddress(fmt.Sprintf("file:planbuild_%s?mode=memory&cache=shared", name)),
++++++		WithCompressionLevel(3),
++++++		WithConnectionLife(30*time.Minute),
++++++		WithConnectionIdle(2),
++++++		WithConnectionOpen(0),
++++++		WithDriver("sqlite3"),
++++++		WithEncryptionKey("A1B2C3D4E5G6H7I8J9K0LMNOPQRSTUVW"),
++++++		WithSkipCreation(false),
++++++		WithLogLevel("warn"),
++++++		WithLogShowSQL(false),
++++++		WithLogSkipNotFound(true),
++++++		WithLogSlowThreshold(200*time.Millisecond),
++++++		WithTracing(&tracing.Client{Config: tracing.Config{EnableTracing: false}}),
++++++	)
++++++	if err != nil {
++++++		t.Fatalf("unable to create test database engine: %v", err)
++++++	}
++++++
++++++	t.Cleanup(func() { _ = db.Close() })
++++++
++++++	return db
++++++}
++++++
++++++func sanitizeDSNName(name string) string {
++++++	out := make([]byte, 0, len(name))
++++++
++++++	for i := range len(name) {
++++++		c := name[i]
++++++		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
++++++			out = append(out, c)
++++++		} else {
++++++			out = append(out, '_')
++++++		}
++++++	}
++++++
++++++	return string(out)
++++++}
++++++
++++++// testPlanRepo creates a user and repo that can own planned builds.
++++++func testPlanRepo(t *testing.T, db Interface) *api.Repo {
++++++	t.Helper()
++++++
++++++	ctx := context.Background()
++++++
++++++	u := new(api.User)
++++++	u.SetName("octocat")
++++++	u.SetToken("superSecretToken")
++++++	u.SetRefreshToken("superSecretRefreshToken")
++++++	u.SetActive(true)
++++++	u.SetAdmin(false)
++++++
++++++	u, err := db.CreateUser(ctx, u)
++++++	if err != nil {
++++++		t.Fatalf("unable to create test user: %v", err)
++++++	}
++++++
++++++	r := new(api.Repo)
++++++	r.SetOwner(u)
++++++	r.SetHash("MzM4N2MzMDAtNmY4Mi00OTA5LWFhZDAtNWIzMTlkNTJkODMy")
++++++	r.SetOrg("github")
++++++	r.SetName("octocat")
++++++	r.SetFullName("github/octocat")
++++++	r.SetLink("https://github.com/github/octocat")
++++++	r.SetClone("https://github.com/github/octocat.git")
++++++	r.SetBranch("main")
++++++	r.SetBuildLimit(10)
++++++	r.SetTimeout(30)
++++++	r.SetCounter(0)
++++++	r.SetHookCounter(0)
++++++	r.SetVisibility("public")
++++++	r.SetActive(true)
++++++	r.SetPipelineType("")
++++++	r.SetApproveBuild(constants.ApproveNever)
++++++	r.SetAllowEvents(api.NewEventsFromMask(1))
++++++	r.SetMergeQueueEvents([]string{})
++++++	r.SetApprovalTimeout(7)
++++++
++++++	r, err = db.CreateRepo(ctx, r)
++++++	if err != nil {
++++++		t.Fatalf("unable to create test repo: %v", err)
++++++	}
++++++
++++++	return r
++++++}
++++++
++++++func testPlanBuild(r *api.Repo) *api.Build {
++++++	b := new(api.Build)
++++++	b.SetRepo(r)
++++++	b.SetEvent(constants.EventPush)
++++++	b.SetStatus(constants.StatusPending)
++++++	b.SetCommit("48afb5bdc41ad69bf22588491333f7cf71135163")
++++++	b.SetBranch("main")
++++++	b.SetRef("refs/heads/main")
++++++	b.SetCreated(time.Now().UTC().Unix())
++++++
++++++	return b
++++++}
++++++
++++++func testPlanServices(b *api.Build) []*api.Service {
++++++	services := make([]*api.Service, 2)
++++++
++++++	for i := range services {
++++++		s := new(api.Service)
++++++		s.SetBuildID(b.GetID())
++++++		s.SetRepoID(b.GetRepo().GetID())
++++++		s.SetNumber(int32(i + 1))
++++++		s.SetName(fmt.Sprintf("service_%d", i+1))
++++++		s.SetImage("alpine:latest")
++++++		s.SetStatus(constants.StatusPending)
++++++		s.SetCreated(time.Now().UTC().Unix())
++++++
++++++		services[i] = s
++++++	}
++++++
++++++	return services
++++++}
++++++
++++++func testPlanSteps(b *api.Build) []*api.Step {
++++++	steps := make([]*api.Step, 3)
++++++
++++++	for i := range steps {
++++++		s := new(api.Step)
++++++		s.SetBuildID(b.GetID())
++++++		s.SetRepoID(b.GetRepo().GetID())
++++++		s.SetNumber(int32(i + 1))
++++++		s.SetName(fmt.Sprintf("step_%d", i+1))
++++++		s.SetImage("alpine:latest")
++++++		s.SetStatus(constants.StatusPending)
++++++		s.SetCreated(time.Now().UTC().Unix())
++++++
++++++		steps[i] = s
++++++	}
++++++
++++++	return steps
++++++}
++++++
++++++// finalizeExecutable is the default successful finalizer used by the tests.
++++++func finalizeExecutable(data []byte, calls *int) FinalizeBuildExecutable {
++++++	return func(b *api.Build, _ []*api.Service, _ []*api.Step) ([]byte, error) {
++++++		if calls != nil {
++++++			*calls++
++++++		}
++++++
++++++		// the finalizer must run once the build has been assigned its identity
++++++		if b.GetID() == 0 || b.GetNumber() == 0 {
++++++			return nil, errors.New("finalizer invoked without a persisted build identity")
++++++		}
++++++
++++++		return data, nil
++++++	}
++++++}
++++++
++++++func TestEngine_PlanBuild_Success(t *testing.T) {
++++++	db := testPlanEngine(t)
++++++	r := testPlanRepo(t, db)
++++++	b := testPlanBuild(r)
++++++	services := testPlanServices(b)
++++++	steps := testPlanSteps(b)
++++++
++++++	executableData := []byte(`{"id":"plan-build-success"}`)
++++++
++++++	result, err := db.PlanBuild(context.Background(), b, services, steps, finalizeExecutable(executableData, nil))
++++++	if err != nil {
++++++		t.Fatalf("PlanBuild returned err: %v", err)
++++++	}
++++++
++++++	if result.Build.GetNumber() != 1 {
++++++		t.Errorf("build number = %d, want 1", result.Build.GetNumber())
++++++	}
++++++
++++++	if result.Build.GetID() == 0 {
++++++		t.Error("build ID should be populated")
++++++	}
++++++
++++++	if len(result.Services) != len(services) {
++++++		t.Errorf("planned services = %d, want %d", len(result.Services), len(services))
++++++	}
++++++
++++++	if len(result.Steps) != len(steps) {
++++++		t.Errorf("planned steps = %d, want %d", len(result.Steps), len(steps))
++++++	}
++++++
++++++	for _, s := range result.Services {
++++++		if s.GetID() == 0 {
++++++			t.Errorf("service %s should have an ID", s.GetName())
++++++		}
++++++
++++++		if s.GetBuildID() != result.Build.GetID() {
++++++			t.Errorf("service %s build_id = %d, want %d", s.GetName(), s.GetBuildID(), result.Build.GetID())
++++++		}
++++++	}
++++++
++++++	for _, s := range result.Steps {
++++++		if s.GetID() == 0 {
++++++			t.Errorf("step %s should have an ID", s.GetName())
++++++		}
++++++
++++++		if s.GetBuildID() != result.Build.GetID() {
++++++			t.Errorf("step %s build_id = %d, want %d", s.GetName(), s.GetBuildID(), result.Build.GetID())
++++++		}
++++++	}
++++++
++++++	// exactly one build should exist for the repo
++++++	count, err := db.CountBuilds(context.Background())
++++++	if err != nil {
++++++		t.Fatalf("CountBuilds returned err: %v", err)
++++++	}
++++++
++++++	if count != 1 {
++++++		t.Errorf("CountBuilds = %d, want 1", count)
++++++	}
++++++
++++++	// the repo counter should reflect the assigned number
++++++	gotRepo, err := db.GetRepo(context.Background(), r.GetID())
++++++	if err != nil {
++++++		t.Fatalf("GetRepo returned err: %v", err)
++++++	}
++++++
++++++	if gotRepo.GetCounter() != 1 {
++++++		t.Errorf("repo counter = %d, want 1", gotRepo.GetCounter())
++++++	}
++++++
++++++	// the full set of services, steps, and their logs should be readable
++++++	gotServices, err := db.ListServicesForBuild(context.Background(), result.Build, nil, 1, 100)
++++++	if err != nil {
++++++		t.Fatalf("ListServicesForBuild returned err: %v", err)
++++++	}
++++++
++++++	if len(gotServices) != len(services) {
++++++		t.Errorf("persisted services = %d, want %d", len(gotServices), len(services))
++++++	}
++++++
++++++	gotSteps, err := db.ListStepsForBuild(context.Background(), result.Build, nil, 1, 100)
++++++	if err != nil {
++++++		t.Fatalf("ListStepsForBuild returned err: %v", err)
++++++	}
++++++
++++++	if len(gotSteps) != len(steps) {
++++++		t.Errorf("persisted steps = %d, want %d", len(gotSteps), len(steps))
++++++	}
++++++
++++++	gotLogs, err := db.ListLogsForBuild(context.Background(), result.Build, 1, 100)
++++++	if err != nil {
++++++		t.Fatalf("ListLogsForBuild returned err: %v", err)
++++++	}
++++++
++++++	if len(gotLogs) != len(services)+len(steps) {
++++++		t.Errorf("persisted logs = %d, want %d", len(gotLogs), len(services)+len(steps))
++++++	}
++++++
++++++	// the executable should be present and round-trip through the pop path,
++++++	// which decrypts and decompresses the data
++++++	gotExecutable, err := db.PopBuildExecutable(context.Background(), result.Build.GetID())
++++++	if err != nil {
++++++		t.Fatalf("PopBuildExecutable returned err: %v", err)
++++++	}
++++++
++++++	if string(gotExecutable.GetData()) != string(executableData) {
++++++		t.Errorf("executable data = %s, want %s", string(gotExecutable.GetData()), string(executableData))
++++++	}
++++++}
++++++
++++++func TestEngine_PlanBuild_FinalizeErrorRollsBack(t *testing.T) {
++++++	db := testPlanEngine(t)
++++++	r := testPlanRepo(t, db)
++++++	b := testPlanBuild(r)
++++++	services := testPlanServices(b)
++++++	steps := testPlanSteps(b)
++++++
++++++	finalizeCalls := 0
++++++
++++++	failingFinalize := func(_ *api.Build, _ []*api.Service, _ []*api.Step) ([]byte, error) {
++++++		finalizeCalls++
++++++
++++++		return nil, errors.New("unable to marshal build executable")
++++++	}
++++++
++++++	result, err := db.PlanBuild(context.Background(), b, services, steps, failingFinalize)
++++++	if err == nil {
++++++		t.Fatal("PlanBuild should have returned err for failing finalizer")
++++++	}
++++++
++++++	if result != nil {
++++++		t.Fatal("PlanBuild should not return a result on failure")
++++++	}
++++++
++++++	if finalizeCalls != 1 {
++++++		t.Errorf("failing finalizer calls = %d, want 1", finalizeCalls)
++++++	}
++++++
++++++	// nothing should have been committed
++++++	count, err := db.CountBuilds(context.Background())
++++++	if err != nil {
++++++		t.Fatalf("CountBuilds returned err: %v", err)
++++++	}
++++++
++++++	if count != 0 {
++++++		t.Errorf("CountBuilds after rollback = %d, want 0", count)
++++++	}
++++++
++++++	gotRepo, err := db.GetRepo(context.Background(), r.GetID())
++++++	if err != nil {
++++++		t.Fatalf("GetRepo returned err: %v", err)
++++++	}
++++++
++++++	if gotRepo.GetCounter() != 0 {
++++++		t.Errorf("repo counter after rollback = %d, want 0", gotRepo.GetCounter())
++++++	}
++++++
++++++	// identifiers assigned in memory must be reset so the caller can retry
++++++	if b.GetID() != 0 || b.GetNumber() != 0 {
++++++		t.Errorf("build identity after rollback = (%d,%d), want (0,0)", b.GetID(), b.GetNumber())
++++++	}
++++++
++++++	for _, s := range services {
++++++		if s.GetID() != 0 || s.GetBuildID() != 0 {
++++++			t.Errorf("service %s identity after rollback = (%d,%d), want (0,0)", s.GetName(), s.GetID(), s.GetBuildID())
++++++		}
++++++	}
++++++
++++++	for _, s := range steps {
++++++		if s.GetID() != 0 || s.GetBuildID() != 0 {
++++++			t.Errorf("step %s identity after rollback = (%d,%d), want (0,0)", s.GetName(), s.GetID(), s.GetBuildID())
++++++		}
++++++	}
++++++
++++++	// retrying with fresh child resources must converge on a single build with
++++++	// a single set of children and a single executable
++++++	b = testPlanBuild(r)
++++++
++++++	retryServices := testPlanServices(b)
++++++	retrySteps := testPlanSteps(b)
++++++
++++++	executableData := []byte(`{"id":"plan-build-retry"}`)
++++++
++++++	retryResult, err := db.PlanBuild(context.Background(), b, retryServices, retrySteps, finalizeExecutable(executableData, nil))
++++++	if err != nil {
++++++		t.Fatalf("retry PlanBuild returned err: %v", err)
++++++	}
++++++
++++++	if retryResult.Build.GetNumber() != 1 {
++++++		t.Errorf("retry build number = %d, want 1", retryResult.Build.GetNumber())
++++++	}
++++++
++++++	count, err = db.CountBuilds(context.Background())
++++++	if err != nil {
++++++		t.Fatalf("CountBuilds after retry returned err: %v", err)
++++++	}
++++++
++++++	if count != 1 {
++++++		t.Errorf("CountBuilds after retry = %d, want 1", count)
++++++	}
++++++
++++++	gotServices, err := db.ListServicesForBuild(context.Background(), retryResult.Build, nil, 1, 100)
++++++	if err != nil {
++++++		t.Fatalf("ListServicesForBuild returned err: %v", err)
++++++	}
++++++
++++++	if len(gotServices) != len(retryServices) {
++++++		t.Errorf("retry services = %d, want %d", len(gotServices), len(retryServices))
++++++	}
++++++
++++++	gotSteps, err := db.ListStepsForBuild(context.Background(), retryResult.Build, nil, 1, 100)
++++++	if err != nil {
++++++		t.Fatalf("ListStepsForBuild returned err: %v", err)
++++++	}
++++++
++++++	if len(gotSteps) != len(retrySteps) {
++++++		t.Errorf("retry steps = %d, want %d", len(gotSteps), len(retrySteps))
++++++	}
++++++
++++++	gotLogs, err := db.ListLogsForBuild(context.Background(), retryResult.Build, 1, 100)
++++++	if err != nil {
++++++		t.Fatalf("ListLogsForBuild returned err: %v", err)
++++++	}
++++++
++++++	if len(gotLogs) != len(retryServices)+len(retrySteps) {
++++++		t.Errorf("retry logs = %d, want %d", len(gotLogs), len(retryServices)+len(retrySteps))
++++++	}
++++++
++++++	_, err = db.PopBuildExecutable(context.Background(), retryResult.Build.GetID())
++++++	if err != nil {
++++++		t.Fatalf("retry PopBuildExecutable returned err: %v", err)
++++++	}
++++++}
++++++
++++++func TestEngine_PlanBuild_InvalidChildRollsBack(t *testing.T) {
++++++	db := testPlanEngine(t)
++++++	r := testPlanRepo(t, db)
++++++	b := testPlanBuild(r)
++++++	services := testPlanServices(b)
++++++	steps := testPlanSteps(b)
++++++
++++++	// an invalid service (missing image) fails validation inside the transaction
++++++	services[1].SetImage("")
++++++
++++++	finalizeCalls := 0
++++++
++++++	result, err := db.PlanBuild(context.Background(), b, services, steps, finalizeExecutable([]byte(`{}`), &finalizeCalls))
++++++	if err == nil {
++++++		t.Fatal("PlanBuild should have returned err for an invalid service")
++++++	}
++++++
++++++	if result != nil {
++++++		t.Fatal("PlanBuild should not return a result on failure")
++++++	}
++++++
++++++	if finalizeCalls != 0 {
++++++		t.Errorf("finalizer should not have been invoked, got %d calls", finalizeCalls)
++++++	}
++++++
++++++	count, err := db.CountBuilds(context.Background())
++++++	if err != nil {
++++++		t.Fatalf("CountBuilds returned err: %v", err)
++++++	}
++++++
++++++	if count != 0 {
++++++		t.Errorf("CountBuilds after rollback = %d, want 0", count)
++++++	}
++++++}
+++diff --git a/evidence/rubric-comparison.txt b/evidence/rubric-comparison.txt
+++new file mode 100644
+++index 00000000..d0bdcaa3
+++--- /dev/null
++++++ b/evidence/rubric-comparison.txt
+++@@ -0,0 +1,8 @@
++++go-vela-server-dd4040cb-c180-4d12-93ce-9438e3e19d12
++++Rubric ID：1｜状态：通过｜期望行为：service 或 step 创建中途失败时，不会暴露可消费的半成品资源图或 executable。｜实际观察：service 或 step 创建中途失败时，不会暴露可消费的半成品资源图或 executable。｜直接证据：database/plan.go:38-53、89-158 在单事务中创建 build、service、step、log placeholder；任一 Validate/Create 失败直接回滚；database/plan_test.go:412-438 TestEngine_PlanBuild_InvalidChildRollsBack。
++++Rubric ID：2｜状态：通过｜期望行为：失败后的重试不会因遗留 build number 冲突，并只产生一套 build、service 和 step。｜实际观察：失败后的重试不会因遗留 build number 冲突，并只产生一套 build、service 和 step。｜直接证据：database/plan.go:200-224 失败后清零 build/service/step ID 与 number；api/build/compile_publish.go:411-425 重试前重置内存对象；database/plan_test.go:288-371 finalize failure retry test。
++++Rubric ID：3｜状态：通过｜期望行为：build executable 创建失败时，已写入资源会被隔离并可恢复，不能留下孤立可领取记录。｜实际观察：build executable 创建失败时，已写入资源会被隔离并可恢复，不能留下孤立可领取记录。｜直接证据：database/plan.go:160-199 在同一事务中 finalize、压缩、加密并插入 executable；回调或 Create 失败回滚 build 与所有子资源；compile_publish.go:462-465 仅在 PlanBuild 成功后返回 queue item。
++++Rubric ID：4｜状态：通过｜期望行为：清理或回滚部分失败后，后续调用可依据持久化状态继续收敛且不会重复创建子资源。｜实际观察：清理或回滚部分失败后，后续调用可依据持久化状态继续收敛且不会重复创建子资源。｜直接证据：PlanBuild 只提交全套资源或零资源；database/plan_test.go:288-371 验证失败后数据库无 build/service/step/log/executable，下一次成功仅一套资源。
++++Rubric ID：5｜状态：通过｜期望行为：webhook、schedule、手动创建和 restart 对规划失败及重试遵守相同完整提交语义。｜实际观察：webhook、schedule、手动创建和 restart 对规划失败及重试遵守相同完整提交语义。｜直接证据：compile_publish.go:41-46 说明同一 helper 用于 webhook、schedule、API build；api/webhook/post.go:451-474、api/build/create.go:115-132、api/build/restart.go:159-171 均调用 CompileAndPublish。
++++Rubric ID：6｜状态：通过｜期望行为：规划前的编译或路由错误、pending approval 与正常成功构建保持既有行为。｜实际观察：规划前的编译或路由错误、pending approval 与正常成功构建保持既有行为。｜直接证据：compile_publish.go:390-403 在进入 PlanBuild 前完成 route 校验并原样返回错误；api/build/restart.go:100-116 继续拒绝 pending approval/merge group；目标包测试通过。
++++有效轮数：87｜Harness：Trae｜exceededTwoHours：否｜sessionDurationSeconds：2835
+++diff --git a/evidence/screenshots/01-rubric-comparison.png b/evidence/screenshots/01-rubric-comparison.png
+++new file mode 100644
+++index 0000000000000000000000000000000000000000..d57a9c8594e9a041564987a846df25c99af9a3cc
+++GIT binary patch
+++literal 91426
+++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
+++zZCh-B!%0D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
+++NQ}dIBC$9eZe*nQcRjvR4
+++
+++literal 0
+++HcmV?d00001
+++
+++diff --git a/evidence/trajectory.md b/evidence/trajectory.md
+++new file mode 100644
+++index 00000000..a902b634
+++--- /dev/null
++++++ b/evidence/trajectory.md
+++@@ -0,0 +1,721 @@
++++# 构建规划资源的完整提交与失败收敛
++++
++++> **Workspace:** F:\swe\098905\project-02
++++
++++---
++++
++++**User**
++++
++++一次构建在写入 build 之后，如果创建 service、step 或 build executable 时数据库报错，用户当前可能看到 error 或 pending 的半成品，随后重试又会用同一个 build number 冲突，甚至留下能够被误取的孤立资源。请让 webhook、schedule、手动创建和 restart 共用的规划流程具备完整提交语义：build、全部 service、全部 step 与 executable 要么作为一套可消费结果出现，要么进入可确定恢复且不会被正常读取或领取的状态；任何中途失败都不能让下一次重试因旧记录冲突，也不能生成第二套子资源。若清理或回滚本身只完成一部分，后续调用应能依据持久化状态继续收敛，而不是依赖本次进程内已经返回的对象列表。重试成功后只保留一个 build number、一套子资源和一个 executable；编译或路由校验发生在规划前的既有错误、需要审批的 pending build 以及正常成功路径保持原有可观察行为。
++++
++++**Assistant**
++++
++++I'll start by exploring the project structure to understand the codebase.
++++
++++toolName: view_folder
++++
++++status: failed
++++
++++f:\swe\098905\project-02
++++
++++toolName: file_search
++++
++++status: success
++++
++++toolName: Shell
++++
++++status: success
++++
++++This is a Go project that appears to be a CI/build system. Let me explore the key directories to understand the build planning flow.
++++
++++toolName: todo_write
++++
++++status: success
++++
++++Todos updated: 6 items
++++
++++toolName: Shell
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\go.mod
++++
++++This is go-vela (Vela CI). Let me examine the key files for build creation flow.
++++
++++toolName: Shell
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\create.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\plan.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\clean.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\compile_publish.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\executable.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\restart.go
++++
++++Now let me look at the service/step planning functions and database layer.
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\gatekeep.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\service\plan.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\step\plan.go
++++
++++Now let me examine the database layer interface and build-related DB operations.
++++
++++toolName: Shell
++++
++++status: success
++++
++++toolName: file_search
++++
++++status: success
++++
++++toolName: file_search
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\build\create.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\build\delete.go
++++
++++Let me examine the database types and the database interface.
++++
++++toolName: file_search
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\interface.go
++++
++++toolName: file_search
++++
++++status: success
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\build\interface.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\types\build.go
++++
++++toolName: file_search
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\enqueue.go
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\executable\create.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\executable\pop.go
++++
++++Now let me look at the webhook handler and schedule execution flow.
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\webhook\post.go
++++
++++Let me find all callers of CompileAndPublish and PlanBuild, plus the schedule processing code.
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\cmd\vela-server\schedule.go
++++
++++Now let me examine the database engine structure to understand transaction capabilities.
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\database.go
++++
++++Let me examine the database service/step create functions and their types.
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\resource.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\service\create.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\step\create.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\log\create.go
++++
++++Let me check the mock layer to understand what needs updating when the interface changes.
++++
++++toolName: Shell
++++
++++status: success
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++Let me look at how the netrc token is generated and other relevant pieces.
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\scm\github\repo.go
++++
++++Let me check how step/service Environment is populated.
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\cache\redis\store_install.go
++++
++++Now let me look at the database types for service, step, log, and executable.
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\types\service.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\types\log.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\types\build_executable.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\build\build.go
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++I have a thorough understanding now. Let me check a few remaining details: the step types, the integration test setup, and the build create test pattern.
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\integration_test.go
++++
++++toolName: Shell
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\build\create_test.go
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: todo_write
++++
++++status: success
++++
++++Todos updated: 8 items
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\types\step.go
++++
++++The design is clear. Let me check how `NewTest` is used in existing database-package tests and the repo creation requirements.
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\database_test.go
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++Now I'll implement. Starting with the atomic transaction method in the database layer:
++++
++++toolName: todo_write
++++
++++status: success
++++
++++Todos updated: 8 items
++++
++++toolName: Write
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\plan.go
++++
++++changes: undefined
++++
++++Now add the method to the database Interface:
++++
++++toolName: edit_file_search_replace
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\interface.go
++++
++++changes: undefined
++++
++++toolName: edit_file_search_replace
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\interface.go
++++
++++changes: undefined
++++
++++Now refactor the service planner into a pure in-memory builder:
++++
++++toolName: Write
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\service\plan.go
++++
++++changes: undefined
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: Write
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\step\plan.go
++++
++++changes: undefined
++++
++++Now rewrite the API-layer PlanBuild to use the atomic transaction:
++++
++++toolName: Write
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\plan.go
++++
++++changes: undefined
++++
++++Now update `compile_publish.go` — move route validation before planning, call the new atomic PlanBuild, and remove the post-plan token/executable tail:
++++
++++toolName: edit_file_search_replace
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\compile_publish.go
++++
++++changes: undefined
++++
++++Now remove the now-redundant token/route/executable tail after the loop:
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\compile_publish.go
++++
++++toolName: edit_file_search_replace
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\compile_publish.go
++++
++++changes: undefined
++++
++++Now remove the obsolete `PublishBuildExecutable` from executable.go:
++++
++++toolName: edit_file_search_replace
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\executable.go
++++
++++changes: undefined
++++
++++toolName: edit_file_search_replace
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\executable.go
++++
++++changes: undefined
++++
++++Now let me build to catch compile errors:
++++
++++toolName: Shell
++++
++++status: success
++++
++++toolName: edit_file_search_replace
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\plan.go
++++
++++changes: undefined
++++
++++toolName: Shell
++++
++++status: success
++++
++++Build passes. Let me verify the approve flow and other consumers remain compatible:
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\approve.go
++++
++++Approve flow is compatible. Now run vet and the relevant existing tests:
++++
++++toolName: Shell
++++
++++status: success
++++
++++Now let me write tests for the atomic planning. First, check the repo/user creation requirements:
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++Now create the test for the atomic planning transaction:
++++
++++toolName: Write
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\plan_test.go
++++
++++changes: undefined
++++
++++toolName: Shell
++++
++++status: success
++++
++++All new tests pass. Now run the full test suites for affected packages:
++++
++++toolName: Shell
++++
++++status: success
++++
++++toolName: Shell
++++
++++status: success
++++
++++toolName: todo_write
++++
++++status: success
++++
++++Todos updated: 8 items
++++
++++toolName: Shell
++++
++++status: success
++++
++++The `scm/github` failures look unrelated (I didn't touch that package). Let me verify they're pre-existing by checking what they do:
++++
++++toolName: Shell
++++
++++status: success
++++
++++That failure is a pre-existing CRLF-vs-LF fixture issue on Windows (`13 10` vs `10`) in `scm/github`, which I never touched. Let me verify the remaining packages (api, cmd, compiler) pass:
++++
++++toolName: Shell
++++
++++status: success
++++
++++toolName: Shell
++++
++++status: success
++++
++++The failing packages are ones I never touched. Let me confirm these failures are pre-existing by checking the test and verifying against a clean tree:
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\compiler\types\pipeline\ruleset_test.go
++++
++++This is a dependency-version-sensitive regex test, unrelated to my change. Let me definitively confirm all three failing packages fail on the clean tree too:
++++
++++toolName: Shell
++++
++++status: success
++++
++++All three failing packages fail identically on the pristine tree — pre-existing Windows/CRLF and dependency-version issues, unrelated to my work. Let me do a final review of the changed `compile_publish.go` flow:
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\build\compile_publish.go
++++
++++Let me verify `queue.Route` is a pure function (safe to call before planning):
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\queue\redis\route.go
++++
++++Pure function confirmed. Let me run gofmt and a final build:
++++
++++toolName: Shell
++++
++++status: success
++++
++++toolName: Shell
++++
++++status: success
++++
++++toolName: Shell
++++
++++status: success
++++
++++Existing files are identically CRLF on this Windows checkout (git stores LF) — my files match the local convention; no action needed. Let me do a final review of the complete diff:
++++
++++toolName: Shell
++++
++++status: success
++++
++++toolName: search_by_regex
++++
++++status: success
++++
++++The primitive DB methods remain in use by tests — correctly retained. Let me run vet across the whole module and the build-package tests once more:
++++
++++toolName: Shell
++++
++++status: success
++++
++++Let me check existing test fakes in the build API package to see if an end-to-end wrapper test is cheap to add:
++++
++++toolName: Shell
++++
++++status: success
++++
++++Let me verify that `Step.Environment()` / `Service.Environment()` don't depend on the DB-assigned ID (since I moved env merging before insert):
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\types\step.go
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\api\types\service.go
++++
++++No ID dependency — env merging is identical pre-insert. Let me do a final read of the new database method to confirm quality:
++++
++++toolName: view_files
++++
++++status: success
++++
++++filePath: f:\swe\098905\project-02\database\plan.go
++++
++++All checks pass. Let me finalize the todo list:
++++
++++toolName: todo_write
++++
++++status: success
++++
++++Todos updated: 8 items
++++
++++已完成。核心思路是把"规划阶段"从多条独立写入改成**单数据库事务的原子提交**，并消除对进程内对象列表的依赖。
++++
++++## 问题根因
++++
++++webhook、schedule、手动创建、restart 共用 [CompileAndPublish](file:///f:/swe/098905/project-02/api/build/compile_publish.go)，原先的顺序是各自独立提交：`CreateBuild`（含 repo counter+1）→ 逐个 `CreateService`/日志 → 逐个 `CreateStep`/日志 → 取 token → 路由校验 → `CreateBuildExecutable`。中途失败时：
++++
++++- [CleanBuild](file:///f:/swe/098905/project-02/api/build/clean.go) 只把 build 标成 error，并依赖内存里带回的列表去 kill 子资源（而 [PlanServices](file:///f:/swe/098905/project-02/api/service/plan.go) 实际从不 append，service 永远清不掉；日志和 executable 也完全不清）；
++++- 重试循环复用同一个 `b`（保留已分配的 ID/number），再调 CreateBuild 必然撞 `(repo_id, number)` 约束；
++++- 留下用户可见的 pending/error 半成品、孤立子资源和会被计数/误取的 executable。
++++
++++## 改动
++++
++++**1. 新增原子规划事务** [database/plan.go](file:///f:/swe/098905/project-02/database/plan.go)（挂到 [database.Interface](file:///f:/swe/098905/project-02/database/interface.go#L45-L49)）：在一个 gorm 事务内依次完成 counter+1 取号 → 插入 build → 插入全部 service 及占位日志 → 插入全部 step 及占位日志 → 回调内生成 SCM token 并序列化 executable → 压缩加密插入 executable。任何一步失败整体回滚：counter 不增、不留任何行；崩溃时未提交事务也会自动消失，恢复只取决于数据库的持久化状态而非内存列表。失败时还会把内存中已分配的 build ID/number 和子资源 ID 清零，保证重试干净。
++++
++++**2. service/step 规划改为纯内存构造**：[api/service/plan.go](file:///f:/swe/098905/project-02/api/service/plan.go)、[api/step/plan.go](file:///f:/swe/098905/project-02/api/step/plan.go) 只负责建对象和 MergeEnv（已确认 Environment() 不依赖数据库生成的 ID），不再各自写库；report_as 的外部 SCM 状态上报移到事务提交后执行（[ReportStepStatuses](file:///f:/swe/098905/project-02/api/step/plan.go#L79-L115)），因为它不可回滚。
++++
++++**3. 重写编排层**：[api/build/plan.go](file:///f:/swe/098905/project-02/api/build/plan.go) 通过事务方法一次提交全部资源；[compile_publish.go](file:///f:/swe/098905/project-02/api/build/compile_publish.go#L390-L428) 把路由校验移到规划之前（失败仍返回 400，但不再留下 error build），token 获取与 executable 落库进入同一事务，重试分支显式重置 ID/number。删除了不再需要的 `PublishBuildExecutable`（[executable.go](file:///f:/swe/098905/project-02/api/build/executable.go)）。
++++
++++## 行为保持
++++
++++- 编译失败、skip、部署校验等规划前错误：路径不变；规划失败现在与它们一样不留 build；
++++- 需要审批的 fork PR：Gatekeep 提交流程不变，executable 仍在待审批期间保留；
++++- 正常成功：201、队列项、SCM 状态、enqueue 等可观察行为不变；队列推送失败后的 CleanBuild（提交之后的失败）维持原样。
++++
++++## 验证
++++
++++新增 [database/plan_test.go](file:///f:/swe/098905/project-02/database/plan_test.go)：成功路径断言 1 个 build、一套 service/step、每个资源一条日志、executable 可 pop 且 counter=1；finalizer 失败/子资源非法时断言零行、counter 不增、内存 ID 清零，并验证随后重试收敛为**唯一**的 build number 1、唯一一套子资源和一个 executable。`go build`、`go vet`、database 与 api 全部相关包测试通过（`scm/github`、`compiler/...` 有 3 个失败，已用 stash 在未改动的干净树上复现，属 Windows CRLF/依赖版本的既有环境问题）。
+++diff --git a/evidence/verification-summary.txt b/evidence/verification-summary.txt
+++new file mode 100644
+++index 00000000..837043db
+++--- /dev/null
++++++ b/evidence/verification-summary.txt
+++@@ -0,0 +1,3 @@
++++读取 CompileAndPublish、PlanBuild、service/step 规划和数据库接口；目标包及重复执行专项测试通过。全量测试中的失败来自未改动的 scm/github CRLF 断言和 compiler/types/pipeline 既有规则断言。
++++
++++Targeted tests: PASS. Full suite: failures are outside changed files and are existing LF/CRLF or pipeline-rule assertions.
+++diff --git a/evidence/verify-rubric.yaml b/evidence/verify-rubric.yaml
+++new file mode 100644
+++index 00000000..f1570959
+++--- /dev/null
++++++ b/evidence/verify-rubric.yaml
+++@@ -0,0 +1,19 @@
++++rubrics:
++++  - id: 1
++++    type: f2p
++++    text: "service 或 step 创建中途失败时，不会暴露可消费的半成品资源图或 executable。"
++++  - id: 2
++++    type: f2p
++++    text: "失败后的重试不会因遗留 build number 冲突，并只产生一套 build、service 和 step。"
++++  - id: 3
++++    type: f2p
++++    text: "build executable 创建失败时，已写入资源会被隔离并可恢复，不能留下孤立可领取记录。"
++++  - id: 4
++++    type: f2p
++++    text: "清理或回滚部分失败后，后续调用可依据持久化状态继续收敛且不会重复创建子资源。"
++++  - id: 5
++++    type: f2p
++++    text: "webhook、schedule、手动创建和 restart 对规划失败及重试遵守相同完整提交语义。"
++++  - id: 6
++++    type: p2p
++++    text: "规划前的编译或路由错误、pending approval 与正常成功构建保持既有行为。"
 +diff --git a/evidence/rubric-comparison.txt b/evidence/rubric-comparison.txt
 +new file mode 100644
 +index 00000000..d0bdcaa3
@@ -9944,11 +13628,11 @@ index 00000000..a902b634
 +新增 [database/plan_test.go](file:///f:/swe/098905/project-02/database/plan_test.go)：成功路径断言 1 个 build、一套 service/step、每个资源一条日志、executable 可 pop 且 counter=1；finalizer 失败/子资源非法时断言零行、counter 不增、内存 ID 清零，并验证随后重试收敛为**唯一**的 build number 1、唯一一套子资源和一个 executable。`go build`、`go vet`、database 与 api 全部相关包测试通过（`scm/github`、`compiler/...` 有 3 个失败，已用 stash 在未改动的干净树上复现，属 Windows CRLF/依赖版本的既有环境问题）。
 diff --git a/evidence/verification-summary.txt b/evidence/verification-summary.txt
 new file mode 100644
-index 00000000..837043db
+index 00000000..8e0dbba6
 --- /dev/null
 +++ b/evidence/verification-summary.txt
 @@ -0,0 +1,3 @@
-+读取 CompileAndPublish、PlanBuild、service/step 规划和数据库接口；目标包及重复执行专项测试通过。全量测试中的失败来自未改动的 scm/github CRLF 断言和 compiler/types/pipeline 既有规则断言。
++审阅构建发布、资源规划、服务步骤创建和数据库事务接口；目标包及重复执行专项测试通过。全量测试出现未改动模块的既有断言失败，属于换行符差异和流水线规则断言。
 +
 +Targeted tests: PASS. Full suite: failures are outside changed files and are existing LF/CRLF or pipeline-rule assertions.
 diff --git a/evidence/verify-rubric.yaml b/evidence/verify-rubric.yaml
